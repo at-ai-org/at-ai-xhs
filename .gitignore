@@ -1,9 +1,183 @@
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-*.code-workspace
+# ============================================================
+# at-ai-xhs
+#   ① 通用规则（Python / Node / Playwright / 编辑器 / 系统 / 测试缓存）
+#   ② 上游 social-auto-upload 遗留规则
+#   ③ 本项目运行产物与敏感文件  ← 最重要，改动前先看清楚
+# ============================================================
 
-# Local History for Visual Studio Code
+# ------------------------------------------------------------
+# ① 通用规则
+# ------------------------------------------------------------
+
+# Python 字节码 / 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Python 打包 / 分发
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# 测试 / 覆盖率 / 类型检查缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+*.cover
+.pyre/
+.pytype/
+cython_debug/
+
+# 安装日志
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 虚拟环境与本地环境变量
+.env
+.env.local
+.env.*.local
+.venv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+
+# Node / Vite 前端
+node_modules/
+.vite/
+package-lock.json
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Playwright / Patchright 测试产物
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# IDE
+.idea/
+.vscode/
 .history/
+*.code-workspace
+.spyderproject
+.spyproject
+.ropeproject
+
+# 操作系统
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# 编辑器临时文件
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# 日志
+*.log
+
+# 其它框架残留（上游沿用的模板）
+instance/
+.webassets-cache
+.scrapy
+.ipynb_checkpoints
+.pdm.toml
+celerybeat-schedule
+celerybeat.pid
+*.sage.py
+*.mo
+*.pot
+/site
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# ------------------------------------------------------------
+# ② 上游 social-auto-upload 遗留规则
+# ------------------------------------------------------------
+
+# 各平台上传器的 cookie json
+tencent_uploader/*.json
+youtube_uploader/*.json
+douyin_uploader/*.json
+bilibili_uploader/*.json
+tk_uploader/*.json
+
+# 全局配置（由 conf.example.py 复制生成，每台机器不一样）
+conf.py
+
+# 账号 cookie 目录
+cookies
+
+# 上传 / 登录临时目录
+cookiesFile
+uploadFile
+videoFile
+
+# 上传过程中生成的登录二维码
+**/qrcode.png
+
+# ------------------------------------------------------------
+# ③ 本项目运行产物与敏感文件
+# ------------------------------------------------------------
+
+# 【敏感】模型配置：含**明文 API Key**，绝对不能提交
+model_settings.json
+
+# 【敏感】账号凭据 / 登录态
+accounts.ini
+cookiesFile/*.json
+cookies/**/*.json
+
+# 数据库（含 journal / WAL 副本）
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+db/*.sqlite3
+
+# 浏览器安装目录（PLAYWRIGHT_BROWSERS_PATH 指向项目内 .browsers/）
+.browsers/
+
+# npm 缓存
+.npm-cache/
+
+# 运行日志与 PID
+logs/
+.run/
+*.pid
+
+# 本地素材与调试截图（体积大，不入库）
+screenshots/
+videos/
+
+# 登录过程中生成的临时二维码图片
+cookiesFile/*_login_qrcode_*.png

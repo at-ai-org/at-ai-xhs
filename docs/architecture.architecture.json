@@ -1,0 +1,357 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "at-ai-xhs 小红书视频笔记 AI 发布工具",
+    "subtitle": "本地单机 · 视频理解 → 文案生成 → 合集匹配 → 定时发布",
+    "output": "architecture.html"
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "创作者",
+      "sublabel": "本地使用者",
+      "pos": [
+        40,
+        330
+      ],
+      "size": [
+        140,
+        66
+      ]
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "本地 Web UI",
+      "sublabel": "审核 · 看板",
+      "pos": [
+        220,
+        330
+      ],
+      "size": [
+        140,
+        66
+      ]
+    },
+    {
+      "id": "ingest",
+      "type": "backend",
+      "label": "媒体接入",
+      "sublabel": "ffprobe · 指纹",
+      "pos": [
+        420,
+        330
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "understand",
+      "type": "backend",
+      "label": "理解管线",
+      "sublabel": "ASR · 抽帧 · OCR",
+      "pos": [
+        610,
+        330
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "generate",
+      "type": "backend",
+      "label": "文案生成",
+      "sublabel": "标题/正文/话题",
+      "pos": [
+        800,
+        330
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "match",
+      "type": "backend",
+      "label": "合集匹配",
+      "sublabel": "召回 · 打分 · 阈值",
+      "pos": [
+        990,
+        330
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "review",
+      "type": "frontend",
+      "label": "人工审核闸门",
+      "sublabel": "确认 / 驳回",
+      "pos": [
+        1180,
+        330
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "pw",
+      "type": "backend",
+      "label": "发布执行器",
+      "sublabel": "Playwright",
+      "pos": [
+        1370,
+        330
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "xhs",
+      "type": "external",
+      "label": "小红书创作平台",
+      "sublabel": "creator.xiaohongshu.com",
+      "pos": [
+        1560,
+        330
+      ],
+      "size": [
+        170,
+        66
+      ]
+    },
+    {
+      "id": "procv",
+      "type": "cloud",
+      "label": "理解 Provider",
+      "sublabel": "ASR + 多模态 VLM",
+      "pos": [
+        615,
+        160
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "文案 LLM",
+      "sublabel": "DeepSeek / Qwen",
+      "pos": [
+        800,
+        160
+      ],
+      "size": [
+        170,
+        64
+      ]
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "本地文件",
+      "sublabel": "视频引用 · 截图",
+      "pos": [
+        420,
+        540
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "SQLite",
+      "sublabel": "任务·草稿·合集",
+      "pos": [
+        610,
+        540
+      ],
+      "size": [
+        150,
+        66
+      ]
+    },
+    {
+      "id": "sched",
+      "type": "backend",
+      "label": "调度器",
+      "sublabel": "APScheduler",
+      "pos": [
+        1180,
+        540
+      ],
+      "size": [
+        150,
+        66
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "智能层 · Provider 可替换",
+      "wraps": [
+        "procv",
+        "llm"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "独立浏览器会话",
+      "wraps": [
+        "pw"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "user",
+      "to": "ui",
+      "label": "选视频 / 确认",
+      "variant": "emphasis",
+      "labelDy": 57
+    },
+    {
+      "from": "ui",
+      "to": "ingest"
+    },
+    {
+      "from": "ingest",
+      "to": "understand"
+    },
+    {
+      "from": "understand",
+      "to": "generate"
+    },
+    {
+      "from": "generate",
+      "to": "match"
+    },
+    {
+      "from": "match",
+      "to": "review"
+    },
+    {
+      "from": "review",
+      "to": "pw",
+      "label": "人工确认后执行",
+      "variant": "emphasis",
+      "labelDy": 57
+    },
+    {
+      "from": "pw",
+      "to": "xhs",
+      "label": "Playwright / CDP",
+      "variant": "emphasis",
+      "labelDy": 57
+    },
+    {
+      "from": "procv",
+      "to": "understand",
+      "label": "转写 + 帧描述",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "llm",
+      "to": "generate",
+      "label": "生成文案",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "ingest",
+      "to": "store",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "understand",
+      "to": "db",
+      "label": "理解缓存",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "sched",
+      "to": "pw",
+      "label": "到点触发",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "route": "orthogonal-h"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "交互层",
+      "items": [
+        "Web UI 只监听 127.0.0.1，单机自用",
+        "审核编辑台：AI 稿可改、显示理解依据与推荐理由",
+        "任务看板：状态时间线 + 失败截图 + 一键重试"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "智能层（Provider 可替换）",
+      "items": [
+        "ASR：默认本地 faster-whisper，口音/专业词多时切云",
+        "视觉：场景切分取关键帧（≤24 帧）→ 多模态描述 + 画面 OCR",
+        "生成：强制 JSON Schema，字数/违禁词硬校验，不通过自动重写"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "合集匹配（本项目核心增量）",
+      "items": [
+        "合集清单每日同步 + 发布前刷新一次",
+        "召回 top5 → 语义打分 → 阈值决策",
+        "≥0.75 自动选中 / 0.55–0.75 待你确认 / 更低则不选"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "发布执行与定时",
+      "items": [
+        "原子步骤 + 多候选选择器回退，每步可截图重试",
+        "URL 跳转 + 笔记列表双重校验，消除「假成功」",
+        "幂等键防重复发布；定时默认走平台原生（1h–14d）"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "风控与合规默认值",
+      "items": [
+        "默认必须人工确认后才提交，不静默发布",
+        "每日 ≤2 条、间隔 ≥120 分钟（带随机抖动）",
+        "遇验证码/平台提示立即停下交人工；不做点赞收藏评论自动化"
+      ]
+    }
+  ]
+}

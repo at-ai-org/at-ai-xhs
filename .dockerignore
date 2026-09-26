@@ -1,0 +1,61 @@
+# 构建上下文排除项。
+# 本仓库根目录下的 videoFile/ 常有几百 MB ~ 数 GB 的本地素材，
+# 不排除的话 `docker build` 光上传上下文就要等很久。
+
+# 版本控制 / 编辑器
+.git
+.gitignore
+.idea
+.vscode
+.history
+
+# 虚拟环境
+.venv
+venv
+env
+
+# 【敏感】配置与凭据：镜像里由 conf.example.py 复制生成 conf.py
+conf.py
+model_settings.json
+accounts.ini
+cookies
+cookiesFile
+
+# 运行产物
+logs
+.run
+.browsers
+.npm-cache
+screenshots
+videos
+*.log
+*.pid
+
+# 本地素材（Dockerfile 内会自行 mkdir）
+videoFile
+uploadFile
+
+# 数据库
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+
+# Python 缓存
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# 前端依赖与构建产物（Dockerfile 在 builder 阶段自行 npm install / build）
+sau_frontend/dist
+sau_frontend/node_modules
+sau_frontend/package-lock.json
+
+# 文档与测试（运行时不依赖）
+docs
+tests
+README.upstream.md
