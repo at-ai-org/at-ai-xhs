@@ -12,6 +12,15 @@
 # 日志：logs/backend.log、logs/frontend.log
 # PID ：.run/backend.pid、.run/frontend.pid
 #
+# ⚠️ 改这个脚本时，变量引用**一律写成 ${var}**，不要写 $var。
+#    实测（bash 3.2，macOS 自带）：
+#      LC_CTYPE=C           $label）  → 正常
+#      LC_CTYPE=zh_CN.UTF-8 $label）  → label）: unbound variable
+#      LC_CTYPE=zh_CN.UTF-8 ${label}）→ 正常
+#    中文终端下 LC_CTYPE 是 UTF-8，bash 3.2 会把全角括号的字节**并进变量名**，
+#    再撞上下面那句 `set -u` 就直接中断。`sh start.sh` 和 `./start.sh` 都可能中招，
+#    而且只在"端口恰好被占用"这类分支上触发，很容易以为脚本没坏。
+#
 set -uo pipefail
 
 # ------------------------------- 配置 -------------------------------------- #
@@ -60,7 +69,7 @@ kill_port() {
     return 0
   fi
 
-  warn "端口 $port 已被占用（$label），准备强制结束"
+  warn "端口 ${port} 已被占用（${label}），准备强制结束"
   local comma_pids
   comma_pids="$(echo "$pids" | tr '\n' ',' | sed 's/,$//')"
   # 打印是什么进程占着，避免误杀时一头雾水
@@ -135,6 +144,34 @@ wait_http() {
   return 1
 }
 
+# 首次启动会随机生成后台登录密码（myUtils/web_auth.py），但它只打进日志里，
+# 而 start.sh 是用 nohup 起的、终端上看不到——不主动捞一次的话，第一次用的人
+# 会卡在登录页上不知道密码是什么。
+#
+# 只提示**本次启动新打印的**那条：日志是追加的，不加偏移量的话每次重启都会把
+# 历史里那条旧密码再翻出来提示一遍（那就成了"密码到底是哪个"的新困惑）。
+show_login_hint() {
+  local mark="${1:-0}" fresh
+  [ -f "$LOG_DIR/backend.log" ] || return 0
+  fresh="$(tail -c "+$((mark + 1))" "$LOG_DIR/backend.log" 2>/dev/null || true)"
+  case "${fresh}" in
+    *已生成后台登录密码*) ;;
+    *) return 0 ;;
+  esac
+
+  # 注意 `^ *密码：` 这个锚点：日志里还有一行「改密码：编辑 settings.json…」，
+  # 它不是密码本身，锚住行首才不会把它当成密码抓出来。
+  local user pass
+  user="$(printf '%s\n' "${fresh}" | grep -m1 '^ *账号：' | sed 's/^ *账号：//' || true)"
+  pass="$(printf '%s\n' "${fresh}" | grep -m1 '^ *密码：' | sed 's/^ *密码：//' || true)"
+
+  printf '\n'
+  ok "已启用后台登录"
+  dim "账号 ${user:-admin}"
+  dim "密码 ${pass:-（见 settings.json 的 auth.password）}"
+  dim "改密码：编辑 settings.json 的 auth.password，或删掉该字段后重启"
+}
+
 # ------------------------------ 后端 --------------------------------------- #
 start_backend() {
   title "后端"
@@ -147,7 +184,10 @@ start_backend() {
     mv "$LOG_DIR/backend.log" "$LOG_DIR/backend.log.1"
     info "日志已轮转：logs/backend.log.1"
   fi
-  info "启动 Flask（端口 $BACKEND_PORT）…"
+  # 记下追加前的日志长度，供 show_login_hint 只捞"本次启动新打印的"那几行
+  local log_mark=0
+  [ -f "$LOG_DIR/backend.log" ] && log_mark="$(wc -c < "$LOG_DIR/backend.log")"
+  info "启动 Flask（端口 ${BACKEND_PORT}）…"
   cd "$ROOT" || return 1
   # 追加而不是覆盖：排查登录/发布问题时，重启一次就把现场清掉太伤了
   printf '\n===== 后端启动 %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_DIR/backend.log"
@@ -157,9 +197,13 @@ start_backend() {
   local pid=$!
   echo "$pid" > "$RUN_DIR/backend.pid"
 
-  # 后端自己不监听 0.0.0.0 之外的路径，用 /xhs/accounts 探测最轻量
-  if wait_http "http://127.0.0.1:$BACKEND_PORT/xhs/accounts" "后端" 40; then
+  # ⚠️ 探测地址必须是**公开接口**。整个后台现在都要登录（myUtils/web_auth.py），
+  #    业务接口（原来的 /xhs/accounts）未登录会回 401，而 `curl -sf` 把 4xx 当失败，
+  #    拿它探测会把"后端其实已经起来了"误报成"启动超时/启动失败"。
+  #    /auth/status 是刻意留的公开探活接口，200 且不泄漏任何信息。
+  if wait_http "http://127.0.0.1:$BACKEND_PORT/auth/status" "后端" 40; then
     dim "PID $pid   日志 logs/backend.log"
+    show_login_hint "$log_mark"
     return 0
   fi
   err "启动失败，最后 15 行日志："
@@ -174,7 +218,7 @@ start_frontend() {
   check_frontend_env || return 1
 
   mkdir -p "$LOG_DIR" "$RUN_DIR"
-  info "启动 Vite（端口 $FRONTEND_PORT）…"
+  info "启动 Vite（端口 ${FRONTEND_PORT}）…"
   cd "$ROOT/sau_frontend" || return 1
   printf '\n===== 前端启动 %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_DIR/frontend.log"
   nohup npm run dev >> "$LOG_DIR/frontend.log" 2>&1 &

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -62,6 +63,21 @@ xhs_bp = Blueprint("xhs", __name__, url_prefix="/xhs")
 # 发布任务表：内存态即可，进程重启后任务丢失，前端会提示"任务不存在"
 _tasks: dict[str, dict] = {}
 _tasks_lock = threading.Lock()
+
+#: 工作台单个发布任务的执行上限（秒）。
+#:
+#: 和发布中心 `sau_backend_publish.PUBLISH_TASK_TIMEOUT` **刻意用同一个开关**：
+#: 用户在界面上看到的是同一件事（"一条笔记发布中"），不该因为走的是哪个入口而行为不同。
+#: 读的是同一个环境变量 SAU_PUBLISH_TASK_TIMEOUT，默认也一样；两个值必须相等，
+#: 有测试钉着（tests/test_xhs_task_watchdog.py::TimeoutConfigTest）。
+#:
+#: 为什么需要：发布是阻塞式浏览器自动化，"卡住"既不抛异常也不超时。工作台这边
+#: 每个任务直接起一个线程（没有发布中心那种通道队列），所以卡住时那个线程就永远
+#: 收不回来，界面上永远停在「发布中」——现场就发生过。
+XHS_TASK_TIMEOUT = float(os.environ.get("SAU_PUBLISH_TASK_TIMEOUT") or 30 * 60)
+
+#: 任务处于这两个状态时，看门狗才有资格判它卡死（其余都是已经落定的终态）
+XHS_ACTIVE_STATES = ("queued", "running")
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +176,39 @@ def _task_update(task_id: str, **fields) -> None:
         if task_id in _tasks:
             _tasks[task_id].update(fields)
             _tasks[task_id]["updated_at"] = time.time()
+
+
+def _task_finish(
+    task_id: str,
+    *,
+    state: str,
+    message: str,
+    steps: list | None = None,
+    _from_watchdog: bool = False,
+) -> bool:
+    """给任务写下**最终结论**，返回是否真的写进去了。
+
+    看门狗判过"卡死"之后，迟到的真实收尾**不许**覆盖这个结论——那是最坏的一种错：
+    用户会以为发上去了，实际可能压根没发。道理和发布中心的
+    `sau_backend_publish._finish_task` 一样（那边有更详细的说明）。
+
+    返回 False 表示这次收尾被忽略，调用方**连发布记录也别再写**，否则记录和任务会打架。
+    """
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return False
+        if task.get("_stuck") and not _from_watchdog:
+            return False
+        fields: dict = {"state": state, "message": message, "finished_at": time.time()}
+        if steps is not None:
+            fields["steps"] = steps
+        if _from_watchdog:
+            # 下划线开头：_task_snapshot 会把它过滤掉，不给前端看到
+            fields["_stuck"] = True
+        task.update(fields)
+        task["updated_at"] = time.time()
+        return True
 
 
 def _task_snapshot(task_id: str) -> dict | None:
@@ -469,7 +518,9 @@ def xhs_publish_api():
             "dry_run": bool(body.get("dry_run")),
             "scheduled": bool(schedule_raw),
             "debug": bool(body.get("debug", False)),
-            "headless": bool(body.get("headless", True)),
+            # 提交阶段就把模式钉死成有头：发布不允许无头（见确认发布处的说明）。
+            # 这里也忽略前端传进来的值，避免"提交时无头、确认时被绕过"。
+            "headless": False,
             "created_at": time.time(),
             "updated_at": time.time(),
             "steps": [],
@@ -610,10 +661,14 @@ def _safe_title_for_filename(title: str, max_len: int = 50) -> str:
     return _FILENAME_KEEP_RE.sub("", title or "")[:max_len]
 
 
-def _sync_file_record(old_disk_name: str, new_disk_name: str, display_name: str) -> None:
+def sync_file_record(old_disk_name: str, new_disk_name: str, display_name: str) -> None:
     """同步 file_records，让「素材管理」里显示标题名。
 
     没有记录就补一条——否则重命名后素材管理里依然看不到这个文件。
+
+    公开命名（不带下划线）是因为**背景音乐合成**（`sau_backend_music.py`）改名后
+    也要走这一步：两边口径必须一致（display_name/file_path/filesize 一起改），
+    各写一份迟早会漏字段。
     """
     disk = Path(BASE_DIR) / "videoFile" / new_disk_name
     size_mb = round(disk.stat().st_size / (1024 * 1024), 2)
@@ -639,6 +694,10 @@ def _rename_material_to_title(video_path: str, title: str) -> tuple[str | None, 
     命名规则：**文件名就是标题**，即 `<标题>.mp4`，只保留中文和数字（见
     `_safe_title_for_filename`），不带 uuid 前缀、不带任何符号。
     重名时在标题后面补数字：`标题2.mp4`、`标题3.mp4`（仍然是纯中文+数字）。
+
+    例外：**已经换过背景音乐**的素材会保留 `-音乐名` 后缀（`标题-音乐名.mp4`）。
+    不带的话，一次"生成文案"会同时抹掉两样东西：用户再也看不出用的哪首音乐，
+    而 `material_bgm` 那行还挂在旧名字上（素材管理里退回「待合成」，但音频其实已经是那首）。
     """
     src = Path(video_path)
     if not src.is_file():
@@ -648,14 +707,16 @@ def _rename_material_to_title(video_path: str, title: str) -> tuple[str | None, 
     if not safe:
         return None, "标题里没有中文或数字，文件名未改动"
 
+    base, music_name = _title_with_music_suffix(safe, src.name)
+
     ext = src.suffix or ".mp4"
-    target = src.with_name(f"{safe}{ext}")
+    target = src.with_name(f"{base}{ext}")
     if target == src:
         return str(src), "文件名已是标题，未改动"
 
     n = 2
     while target.exists():
-        target = src.with_name(f"{safe}{n}{ext}")
+        target = src.with_name(f"{base}{n}{ext}")
         n += 1
         if n > 99:
             return None, "同名文件过多，放弃重命名"
@@ -664,8 +725,50 @@ def _rename_material_to_title(video_path: str, title: str) -> tuple[str | None, 
     rename_material_copy(src.name, target.name)
     # 展示名同步成新文件名（**带扩展名**：素材管理靠后缀判断是视频还是图片，
     # 不带后缀会被判成"未知类型"，预览就只剩一行文件信息、没有播放器）
-    _sync_file_record(src.name, target.name, target.name)
+    sync_file_record(src.name, target.name, target.name)
+    # 背景音乐状态跟着搬（没有音乐后缀说明没合成过/合成失败，把旧名字上的残留清掉）
+    if music_name:
+        _rename_bgm_status(src.name, target.name)
+    else:
+        _delete_bgm_status(src.name)
     return str(target), f"素材已重命名为「{target.name}」"
+
+
+def _title_with_music_suffix(safe_title: str, disk_name: str) -> tuple[str, str]:
+    """给"标题"补上已有的 `-音乐名` 后缀，返回 `(文件名主名, 音乐名)`。
+
+    只认**已合成**（`done`）的状态：待合成/失败的素材没有成品音轨，加后缀只会误导。
+    延迟 import：这个模块被 CLI 等入口导入时不一定要拉起背景音乐那套东西。
+    """
+    try:
+        from myUtils.background_music import STATUS_DONE, get_status, safe_music_segment
+
+        status = get_status(disk_name)
+        if status.get("status") == STATUS_DONE and status.get("music_name"):
+            segment = safe_music_segment(status["music_name"])
+            if segment:
+                return f"{safe_title}-{segment}", segment
+    except Exception as exc:
+        print(f"⚠️ 读取背景音乐状态失败（改名时按未合成处理）: {exc}")
+    return safe_title, ""
+
+
+def _rename_bgm_status(old_name: str, new_name: str) -> None:
+    try:
+        from myUtils.background_music import rename_status
+
+        rename_status(old_name, new_name)
+    except Exception as exc:
+        print(f"⚠️ 同步背景音乐状态失败（不影响改名）: {exc}")
+
+
+def _delete_bgm_status(disk_name: str) -> None:
+    try:
+        from myUtils.background_music import delete_status
+
+        delete_status(disk_name)
+    except Exception as exc:
+        print(f"⚠️ 清理背景音乐状态失败（不影响改名）: {exc}")
 
 
 def _generate_worker(task_id: str) -> None:
@@ -781,11 +884,6 @@ def xhs_task_confirm(task_id: str):
         patch["original"] = bool(body.get("original"))
     if "dry_run" in body:
         patch["dry_run"] = bool(body.get("dry_run"))
-    # 浏览器模式在**确认这一刻**才定：默认无头，前端点「有头浏览器发布」时传 headless=false。
-    # 无头跑得快、不弹窗口，但小红书风控更容易有反应；被提示时改用有头重跑一次即可
-    # （任务停在「待确认」时两种模式都能选，不用重新提交素材）。
-    if "headless" in body:
-        patch["headless"] = bool(body.get("headless"))
 
     # 用确认后的最终值做校验（而不是提交时的旧值）
     final_title = (patch.get("title", snapshot.get("title") or "") or "").strip()
@@ -800,12 +898,20 @@ def xhs_task_confirm(task_id: str):
         except ValueError:
             return _err("定时时间格式应为 YYYY-MM-DD HH:MM", 400)
 
-    headless = bool(patch["headless"]) if "headless" in patch else bool(snapshot.get("headless", True))
-    mode_text = "无头浏览器" if headless else "有头浏览器（本机弹窗）"
+    # 浏览器模式是**固定**的：小红书发布一律走有头（本机弹窗），不再是可选档。
+    # 原因：2026-03-10 小红书《关于打击AI托管运营账号的治理公告》明确禁止"利用技术
+    # 手段模拟真人"，并对"与真人操作习惯不符"的行为特征分档处罚。无头发布是这条链路
+    # 上最扎眼的特征，所以直接砍掉这个选项——就连前端传了 headless=true 也一律覆盖，
+    # 避免绕过。只读操作（扫码登录 / 自检 / 列合集）不受影响。
+    headless = False
+    mode_text = "有头浏览器（本机弹窗）"
     patch.update(
         {
             "state": "queued",
             "stage": "publish",
+            # 把有头写回任务快照：worker/发布记录/前端都读这个字段，
+            # 不能只改局部变量，否则旧值（可能是在无头档下建的）会留在快照里。
+            "headless": headless,
             "message": f"已确认（{mode_text}发布），排队等待浏览器",
             "scheduled": bool(schedule_raw),
             "confirmed_at": time.time(),
@@ -865,6 +971,59 @@ def xhs_task_cancel(task_id: str):
     return _ok({"task_id": task_id})
 
 
+def _xhs_timeout_message() -> str:
+    minutes = XHS_TASK_TIMEOUT / 60
+    shown = f"{minutes:.0f} 分钟" if minutes >= 1 else f"{XHS_TASK_TIMEOUT:.0f} 秒"
+    return (
+        f"执行超时：超过 {shown} 没有结束，已判定卡住。"
+        f"这类卡住多半是在等一个不再响应的浏览器，线程无法被安全中断，"
+        f"它可能还占着这个账号——建议重启后端回收资源后重试。"
+    )
+
+
+def _arm_xhs_watchdog(
+    task_id: str, record_id: int, snapshot: dict, log_sink: list[dict], started_at: float
+) -> threading.Timer:
+    """给工作台的发布任务装超时看门狗；正常结束必须用 `_disarm_xhs_watchdog` 取消。
+
+    和发布中心（`sau_backend_publish._arm_watchdog`）同样的道理：卡住的线程收不回来，
+    但**结论必须改对**，否则界面上永远是「发布中」，用户既不知道发生了什么、
+    也没法判断能不能重试。
+
+    工作台这边没有发布中心那种"通道队列"，每个任务自己一个线程，所以看门狗不需要
+    再通知谁往下走，只要把任务和发布记录收尾即可。
+    """
+
+    def _on_timeout() -> None:
+        with _tasks_lock:
+            task = _tasks.get(task_id)
+            if task is None or task.get("state") not in XHS_ACTIVE_STATES:
+                return  # 已经正常收尾，或压根还没开始跑
+            app = task.get("_app")
+        steps = [r.to_dict() for r in getattr(app, "step_results", [])] if app else []
+        message = _xhs_timeout_message()
+        if not _task_finish(
+            task_id, state="failed", message=message, steps=steps, _from_watchdog=True
+        ):
+            return
+        print(f"⏱️ 小红书工作台任务执行超时，判定卡住: {task_id}")
+        try:
+            _finish_record(record_id, snapshot, steps, log_sink, started_at, steps, message)
+        except Exception as exc:  # 写记录失败不能反过来影响任务结论
+            print(f"⚠️ 超时任务写发布记录失败（不影响任务判定）: {exc}")
+
+    timer = threading.Timer(XHS_TASK_TIMEOUT, _on_timeout)
+    timer.daemon = True
+    timer.name = f"xhs-watchdog-{task_id[:8]}"
+    timer.start()
+    return timer
+
+
+def _disarm_xhs_watchdog(timer: threading.Timer | None) -> None:
+    if timer is not None:
+        timer.cancel()
+
+
 def _publish_worker(task_id: str) -> None:
     """阶段二：真正驱动浏览器发布。"""
     snapshot = _task_snapshot(task_id)
@@ -872,8 +1031,9 @@ def _publish_worker(task_id: str) -> None:
         return
 
     # 浏览器操作串行（同账号多会话会互相踢下线）：先标排队，拿到锁再转 running
-    headless = bool(snapshot.get("headless", True))
-    mode_text = "无头浏览器" if headless else "有头浏览器（本机弹窗）"
+    # 模式固定有头：发布不允许无头，这里直接钉死，不读 snapshot 里的旧值
+    headless = False
+    mode_text = "有头浏览器（本机弹窗）"
     _task_update(task_id, state="queued", message=f"排队中（浏览器操作串行执行，{mode_text}）")
     record_id = int(snapshot.get("record_id") or 0)
     log_sink: list[dict] = []
@@ -890,7 +1050,13 @@ def _publish_worker(task_id: str) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = None
+    watchdog: threading.Timer | None = None
     try:
+        # 看门狗从这里起算（任务真正开始执行）；正常收尾时会把它取消。
+        # 装在 try 里面而不是外面：万一装表本身就失败，异常会被下面的 except 接住、
+        # 把任务判失败；装在外面的话线程会直接死掉，任务永远停在「queued」——那正是
+        # 这次要消灭的"静默卡住"。
+        watchdog = _arm_xhs_watchdog(task_id, record_id, snapshot, log_sink, started_at)
         schedule_raw = (snapshot.get("schedule") or "").strip()
         schedule_at: datetime | int = 0
         if schedule_raw:
@@ -934,19 +1100,16 @@ def _publish_worker(task_id: str) -> None:
         steps = [r.to_dict() for r in getattr(app, "step_results", [])]
         failed = [s for s in steps if s["status"] == "failed"]
         message = "；".join(s["message"] for s in failed) if failed else "完成"
-        _task_update(
-            task_id,
-            state="failed" if failed else "success",
-            message=message,
-            steps=steps,
-            finished_at=time.time(),
-        )
-        _finish_record(record_id, snapshot, steps, log_sink, started_at, failed, message)
+        # 看门狗已经判过卡死的话这里会返回 False，那就连发布记录也别再写——
+        # 否则任务和记录会各说各话
+        if _task_finish(task_id, state="failed" if failed else "success", message=message, steps=steps):
+            _finish_record(record_id, snapshot, steps, log_sink, started_at, failed, message)
     except Exception as exc:
         steps = [r.to_dict() for r in getattr(app, "step_results", [])] if app else []
-        _task_update(task_id, state="failed", message=str(exc), steps=steps, finished_at=time.time())
-        _finish_record(record_id, snapshot, steps, log_sink, started_at, steps, str(exc))
+        if _task_finish(task_id, state="failed", message=str(exc), steps=steps):
+            _finish_record(record_id, snapshot, steps, log_sink, started_at, steps, str(exc))
     finally:
+        _disarm_xhs_watchdog(watchdog)
         progress.unbind()
         loop.close()
 
@@ -1015,8 +1178,8 @@ def _finish_record(
         else:
             status = records.STATUS_SUCCESS
             message = "已提交，建议到平台确认发布结果"
-        # 记录里标明这条是哪种浏览器模式跑的：出了风控提示时能据此判断"要不要换有头重跑"
-        mode_text = "无头浏览器" if snapshot.get("headless", True) else "有头浏览器"
+        # 模式固定有头（发布不再提供无头档），这里如实记录，便于回溯
+        mode_text = "有头浏览器"
         mode_note = f"（{mode_text}）"
         records.update_record(
             record_id,

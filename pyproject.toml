@@ -11,7 +11,14 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
   "loguru==0.7.3",
   "opencv-python>=4.13.0.92",
-  "patchright==1.58.2",
+  # patchright 与 playwright 必须成对出现、且版本一致：
+  #   * patchright —— 四个平台（小红书/视频号/抖音/快手）的发布驱动（15 个文件 import patchright.async_api）；
+  #   * playwright —— myUtils/auth.py、myUtils/login.py 的扫码登录 / cookie 校验，以及几个老上传器；
+  # patchright 并不依赖 playwright，所以两个都得写。版本不一致的话，两个驱动会各自去找
+  # 自己版本的浏览器目录，机器上就得多装一份 chromium（几百 MB，而且很容易只装到一份）。
+  # 1.63.0 是本地 .venv 里已验证能跑的那一版，requirements.txt 也与之对齐。
+  "patchright==1.63.0",
+  "playwright==1.63.0",
   "qrcode==8.2",
   "requests==2.32.3",
   "segno>=1.6.6",

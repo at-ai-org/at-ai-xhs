@@ -14,6 +14,8 @@ from patchright.async_api import async_playwright
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils.humanize import human_type
+from utils.humanize import jitter_schedule
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -25,6 +27,17 @@ from . import selectors as S
 from .page_ops import OpResult
 from .page_ops import SelftestReport
 from .page_ops import XhsPageOps
+
+# 发布行为设置走 settings 的防御性读取：conf.py 是本地文件，老副本里没有新项，
+# 直接 `from conf import XHS_...` 会在升级后 ImportError 把整条发布链路打断。
+# 原因与默认值见 settings.py。
+from .settings import XHS_HUMAN_TYPE_BUDGET
+from .settings import XHS_HUMAN_TYPE_DELAY
+from .settings import XHS_LOCALE
+from .settings import XHS_PUBLISH_MAX_ATTEMPTS
+from .settings import XHS_SCHEDULE_JITTER_MINUTES
+from .settings import XHS_TIMEZONE
+from .settings import XHS_VIEWPORT
 
 XHS_DEFAULT_CREATOR_BASE_URL = "https://creator.xiaohongshu.com"
 XHS_CREATOR_BASE_URL_ENV = "SAU_XHS_CREATOR_BASE_URL"
@@ -47,6 +60,59 @@ def _build_xhs_creator_url(path: str) -> str:
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+# --------------------------------------------------------------------------- #
+# 浏览器启动 / 上下文：发布的"人味"收口在这里，避免每个入口抄一遍
+# --------------------------------------------------------------------------- #
+
+async def _launch_xhs(playwright: Playwright, *, headless: bool, purpose: str = "read"):
+    """启动小红书用的浏览器。
+
+    `purpose="publish"` 时**强制有头**，而且是硬编码、不读任何配置：
+    2026-03-10 小红书《关于打击AI托管运营账号的治理公告》明确禁止"利用技术手段
+    模拟真人"，无头发布是这条链路上最扎眼、也最容易触发"与真人操作习惯不符"判定的
+    行为特征。刻意不留配置开关——留了迟早会被打开，然后回到被限流的老路上。
+
+    `purpose="read"`（扫码登录 / 自检 / 列合集）不受影响，仍按传入值走：
+    这些操作不提交任何内容，无头是为了快和不打扰用户。
+    """
+    if purpose == "publish" and headless:
+        xiaohongshu_logger.info(
+            _msg("🪟", "发布一律用有头浏览器（本机弹窗）——无头发布是风控的主要触发点，已强制覆盖")
+        )
+        headless = False
+
+    if LOCAL_CHROME_PATH:
+        return await playwright.chromium.launch(headless=headless, executable_path=LOCAL_CHROME_PATH)
+    return await playwright.chromium.launch(headless=headless, channel="chromium")
+
+
+async def _new_xhs_context(
+    browser,
+    *,
+    storage_state: str | None = None,
+    permissions: list[str] | None = None,
+):
+    """建一个"跟真人机器尽量一致"的浏览器上下文。
+
+    只对齐**有明确真人取值**的几项（语言/时区/视口），**刻意不设 user_agent**：
+    硬编码 UA 一旦与真实内核版本对不上，本身就是更强的指纹；有头模式下直接用真实
+    内核的 UA 最稳。任何一项配置为空/非法都不会抛异常，最差退回 Playwright 默认值。
+    """
+    kwargs: dict = {}
+    if storage_state:
+        kwargs["storage_state"] = storage_state
+    if permissions:
+        kwargs["permissions"] = permissions
+    if XHS_LOCALE:
+        kwargs["locale"] = XHS_LOCALE
+    if XHS_TIMEZONE:
+        kwargs["timezone_id"] = XHS_TIMEZONE
+    if isinstance(XHS_VIEWPORT, dict) and XHS_VIEWPORT.get("width") and XHS_VIEWPORT.get("height"):
+        kwargs["viewport"] = {"width": int(XHS_VIEWPORT["width"]), "height": int(XHS_VIEWPORT["height"])}
+
+    return await set_init_script(await browser.new_context(**kwargs))
 
 
 async def _js_click_by_text(page: Page, text: str) -> bool:
@@ -184,13 +250,10 @@ async def cookie_auth(account_file):
         return False
 
     async with async_playwright() as playwright:
-        if LOCAL_CHROME_PATH:
-            browser = await playwright.chromium.launch(headless=True, executable_path=LOCAL_CHROME_PATH)
-        else:
-            browser = await playwright.chromium.launch(headless=True, channel="chromium")
+        # 只读校验：不提交任何内容，保持无头（快、不打扰用户）
+        browser = await _launch_xhs(playwright, headless=True, purpose="read")
         try:
-            context = await browser.new_context(storage_state=account_file)
-            context = await set_init_script(context)
+            context = await _new_xhs_context(browser, storage_state=account_file)
             page = await context.new_page()
             await page.goto(
                 _build_xhs_creator_url(
@@ -258,9 +321,8 @@ async def xiaohongshu_cookie_gen(
     account_path.parent.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-        context = await browser.new_context()
-        context = await set_init_script(context)
+        browser = await _launch_xhs(playwright, headless=headless, purpose="read")
+        context = await _new_xhs_context(browser)
         qrcode_path = None
         qrcode_info = None
         result = _build_login_result(False, "failed", "小红书登录失败", account_file)
@@ -346,6 +408,12 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             self.publish_date = 0
 
     async def set_schedule_time_xiaohongshu(self, page: Page, publish_date: datetime):
+        # 加随机抖动：真人预约发布不会卡在 20:00:00 这种整点整分（见 conf.XHS_SCHEDULE_JITTER_MINUTES）
+        publish_date, shift_minutes = jitter_schedule(publish_date, XHS_SCHEDULE_JITTER_MINUTES)
+        if shift_minutes:
+            xiaohongshu_logger.info(
+                _msg("🎲", f"定时时间随机后移 {shift_minutes} 分钟，避开整点整分特征")
+            )
         xiaohongshu_logger.info(_msg("🕒", f"小人准备设置定时发布时间: {publish_date.strftime(self.date_format)}"))
         await page.locator('.custom-switch-card').filter(has_text="定时发布").locator('.d-switch').click()
         await asyncio.sleep(1)
@@ -415,7 +483,12 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
 
     async def fill_title(self, page: Page) -> None:
         title_container = page.locator('input[placeholder*="填写标题"]')
-        await title_container.fill(self.title[:20])
+        # 逐字输入而不是 fill()：fill() 直接设 value，不产生逐键 keydown/keyup，
+        # 是最容易被判定为"与真人操作习惯不符"的一条。
+        await title_container.click()
+        await page.keyboard.press("Control+KeyA")
+        await page.keyboard.press("Delete")
+        await human_type(page, self.title[:20], delay=XHS_HUMAN_TYPE_DELAY, budget_s=XHS_HUMAN_TYPE_BUDGET)
 
     async def fill_desc(self, page: Page) -> None:
         if not getattr(self, "desc", ""):
@@ -426,7 +499,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         await page.keyboard.press("Backspace")
         await page.keyboard.press("Control+KeyA")
         await page.keyboard.press("Delete")
-        await page.keyboard.type(self.desc)
+        await human_type(page, self.desc, delay=XHS_HUMAN_TYPE_DELAY, budget_s=XHS_HUMAN_TYPE_BUDGET)
         await page.keyboard.press("Enter")
 
     async def fill_tags(self, page: Page) -> None:
@@ -758,12 +831,12 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
+        browser = await _launch_xhs(playwright, headless=self.headless, purpose="publish")
+        context = await _new_xhs_context(
+            browser,
             permissions=["geolocation"],
             storage_state=self.account_file,
         )
-        context = await set_init_script(context)
 
         try:
             page = await context.new_page()
@@ -859,34 +932,70 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
+        # ---- 提交（有界重试）----
+        # 上游是 `while True` + 0.5s 无限重试：被平台校验（字数/违规/风控）拦下时会变成
+        # "每 0.5 秒点一次发布、永不停止"——这既是"与真人操作习惯不符"的典型脚本特征，
+        # 也是个稳定性 bug（真被拦了不会报错退出，只会一直点）。改成有界重试。
+        button_text = (
+            "定时发布"
+            if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED
+            else "发布"
+        )
+        publish_button = page.locator(f'button:has-text("{button_text}")')
+        last_error: Exception | None = None
+
+        for attempt in range(1, XHS_PUBLISH_MAX_ATTEMPTS + 1):
             try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
-                await page.wait_for_url(
-                    XHS_PUBLISH_SUCCESS_URL_PATTERN,
-                    timeout=3000
-                )
+                await publish_button.click()
+                # 等待时间要明显宽于点击间隔：否则会把"已经点成功、页面还在跳转"
+                # 误判成失败并重复点击，那会变成重复发布——比失败更糟。
+                await page.wait_for_url(XHS_PUBLISH_SUCCESS_URL_PATTERN, timeout=15000)
                 xiaohongshu_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
-                break
+                return
+            except Exception as exc:
+                last_error = exc
+                xiaohongshu_logger.warning(
+                    _msg("🏃", f"第 {attempt}/{XHS_PUBLISH_MAX_ATTEMPTS} 次提交未确认成功: {exc}")
+                )
+
+            # 重试前先确认"还停在发布页"。按钮已经消失说明页面跳走了——提交大概率其实
+            # 生效了，此时绝不能再点第二次。宁可停下让人去后台核对，也不要重复发布。
+            try:
+                still_on_form = await publish_button.count() > 0
             except Exception:
-                xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
+                still_on_form = False
+            if not still_on_form:
+                xiaohongshu_logger.warning(
+                    _msg(
+                        "🤔",
+                        "没等到发布成功页，但发布按钮已经消失——很可能其实已提交成功。"
+                        "已停止重试，请到小红书创作中心核对这条笔记是否真的发出去了。",
+                    )
+                )
+                return
+
+            if attempt >= XHS_PUBLISH_MAX_ATTEMPTS:
                 if self.debug:
                     await page.screenshot(full_page=True)
-                await asyncio.sleep(0.5)
+                raise RuntimeError(
+                    f"连续 {XHS_PUBLISH_MAX_ATTEMPTS} 次提交都没跳到发布成功页，"
+                    f"很可能被平台校验（违规/风控）拦下。请到小红书创作中心确认这条是否已发出，"
+                    f"不要盲目重跑。最后错误: {last_error}"
+                ) from last_error
+
+            # 退避：重试间隔递增，不要固定节奏（固定间隔本身就是机器特征）
+            await asyncio.sleep(3 + attempt * 2)
 
     async def upload(self, playwright: Playwright) -> None:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
+        browser = await _launch_xhs(playwright, headless=self.headless, purpose="publish")
+        context = await _new_xhs_context(
+            browser,
             permissions=["geolocation"],
             storage_state=self.account_file,
         )
-        context = await set_init_script(context)
 
         try:
             page = await context.new_page()
@@ -921,9 +1030,9 @@ async def _with_creator_page(account_file: str, headless: bool, work):
         )
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, channel="chromium")
-        context = await browser.new_context(storage_state=account_file)
-        context = await set_init_script(context)
+        # 自检 / 列合集都是只读操作，不提交内容，允许无头
+        browser = await _launch_xhs(playwright, headless=headless, purpose="read")
+        context = await _new_xhs_context(browser, storage_state=account_file)
         try:
             page = await context.new_page()
             return await work(page)

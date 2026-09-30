@@ -8,6 +8,21 @@ from unittest.mock import AsyncMock, patch
 import uploader.xiaohongshu_uploader.main as xhs_main
 
 
+def _typed_chars(keyboard) -> str:
+    """把"逐字输入"还原回完整字符串。
+
+    人性化输入（utils.humanize.human_type）是一字一条 `type` 记录，
+    所以直接找整串 `("type", "描述内容", None)` 会找不到；这里把单字记录拼起来。
+    话题标签走的是整串 + delay=30，因此按 len==1 且 delay 为 None 过滤即可区分。
+    """
+    return "".join(
+        action[1]
+        for action in keyboard.actions
+        # press 记的是 ("press", key) 两元组，type 是 ("type", text, delay) 三元组
+        if action[0] == "type" and len(action[1]) == 1 and action[2] is None
+    )
+
+
 class FakeLocator:
     def __init__(self, name, count=0, src=None, children=None):
         self.name = name
@@ -153,6 +168,31 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["status"], "cookie_invalid")
 
+    def test_publish_launch_never_uses_headless(self):
+        """发布一律有头：即使调用方传 headless=True，_launch_xhs 也必须覆盖掉。
+
+        无头发布是小红书"与真人操作习惯不符"判定的主要来源（2026-03-10
+        《关于打击AI托管运营账号的治理公告》），所以这一条是硬编码、不读任何配置。
+        """
+        calls = []
+
+        class FakeChromium:
+            async def launch(self, **kwargs):
+                calls.append(kwargs)
+                return object()
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        asyncio.run(
+            xhs_main._launch_xhs(FakePlaywright(), headless=True, purpose="publish")
+        )
+        self.assertFalse(calls[0]["headless"], "发布不允许无头")
+
+        # 只读操作（扫码登录 / 自检 / 列合集）不受影响：不提交内容，无头是为了快
+        asyncio.run(xhs_main._launch_xhs(FakePlaywright(), headless=True, purpose="read"))
+        self.assertTrue(calls[1]["headless"], "只读操作仍可无头")
+
     def test_setup_uses_login_flow_when_handle_is_true(self):
         login_result = {
             "success": True,
@@ -229,21 +269,30 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         )
         page = RecordingPage()
 
-        asyncio.run(app.fill_meta(page))
+        # 延时置 0：只验证"改成逐字输入了"，不把测试耗在真实的打字节奏上
+        with patch.object(xhs_main, "XHS_HUMAN_TYPE_DELAY", (0, 0)):
+            asyncio.run(app.fill_meta(page))
 
+        # 标题不再用 fill() 直接赋值（那不会产生逐键 keydown/keyup，是最扎眼的机器特征），
+        # 改成先点击拿焦点，再逐字敲进去
         self.assertEqual(
             page.locators['input[placeholder*="填写标题"]'].actions,
-            [("fill", "标题内容")],
+            [("click",)],
         )
+        typed = _typed_chars(page.keyboard)
+        self.assertIn("标题内容", typed, "标题必须逐字输入")
+        self.assertIn("描述内容", typed, "正文必须逐字输入")
+
         self.assertEqual(
             page.locators['p[data-placeholder*="输入正文描述"]'].actions,
             [("click",)],
         )
-        self.assertIn(("type", "描述内容", None), page.keyboard.actions)
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
         self.assertEqual(
             page.locators['#creator-editor-topic-container .item'].actions,
-            [("wait_for", {"state": "visible", "timeout": 2000}), ("click",)],
+            # 4000 是代码里的实际值（main.py 的 fill_tags）。这条断言原先写的 2000
+            # 在本次改动前就已经和代码对不上了——顺手对齐，不属于这次行为变更。
+            [("wait_for", {"state": "visible", "timeout": 4000}), ("click",)],
         )
 
     def test_video_fill_meta_can_fill_first_tag_without_desc(self):

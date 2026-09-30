@@ -24,9 +24,54 @@ from utils.log import douyin_logger
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
+# ── 点「发布」之后等多久、等多久算彻底失败 ──────────────────────────────────
+#
+# 上游是"点完只等 3 秒，不行就再点一次，`while True` 永不放弃"，两处都在真机上出过事：
+#
+# 1. `DOUYIN_PUBLISH_CONFIRM_TIMEOUT_MS = 3000`：Web 端一次提交 3 个平台时，请求要排队，
+#    点完发布 3 秒内 URL 没变是**常态**（实测 2026-09-29 17:15:42）。那是"慢"不是"坏"，
+#    多等一会儿就过了；等太短还会导致对着同一个按钮反复点，机器特征也难看。
+# 2. 失败之后没有任何总预算。平台真出问题时它会一直点下去，直到 30 分钟的看门狗
+#    才被判死——而看门狗给的原因（"卡住"）跟真相（发布被平台拦住）对不上。
+#    上游小红书那条路已经因为同样的理由改成有界重试（见 conf.py 的说明），这里对齐。
+DOUYIN_PUBLISH_CONFIRM_TIMEOUT_MS = 10_000
+DOUYIN_PUBLISH_TIMEOUT_SECONDS = 300
+
+# 失败取证的截图预算。截图前 Playwright 要等 `document.fonts.ready`
+# （日志里的 "waiting for fonts to load..."），默认 30 秒；机器忙时这个等待会超时，
+# 而它原来位于 retry 分支里、没有自己的超时——一超时就把整条发布判死。
+DOUYIN_DEBUG_SHOT_TIMEOUT_MS = 5_000
+
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+async def _debug_shot(page, tag: str) -> str:
+    """发布重试时留一张现场全页截图，返回保存路径（失败返回空串）。
+
+    **这个函数自己绝不允许把任务搞失败。** 原来的写法是
+    `await page.screenshot(full_page=True)`——没有 path（拿到的字节直接丢掉，
+    出事时什么都没留下），也没有自己的超时；而它写在 `except` 分支里，
+    一旦等字体等到默认 30 秒超时，异常就冒出去把"再试一次就能成功"的发布判死。
+    实测 2026-09-29 17:16 抖音 id=84 就是以
+    `Page.screenshot: Timeout 30000ms exceeded ... waiting for fonts to load` 收场的，
+    同一条任务第二轮 73 秒发成功。
+
+    取证要有界、要落盘、异常不许外溢。
+    """
+    try:
+        base = Path("screenshots")
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{datetime.now():%Y%m%d-%H%M%S}-{tag}.png"
+        await page.screenshot(
+            path=str(path), full_page=True, timeout=DOUYIN_DEBUG_SHOT_TIMEOUT_MS
+        )
+        douyin_logger.warning(_msg("📸", f"已保存截图: {path}"))
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 —— 截图失败绝不能影响发布
+        douyin_logger.warning(_msg("📸", f"截图失败（不影响发布继续）: {exc}"))
+        return ""
 
 
 async def _ask_sms_code() -> str:
@@ -1114,9 +1159,39 @@ class DouYinVideo(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
+        await self.publish_with_sms_guard(page)
+
+        await context.storage_state(path=self.account_file)
+        douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
+        await asyncio.sleep(2)
+        await context.close()
+        await browser.close()
+
+    async def publish_with_sms_guard(self, page: Page) -> None:
+        """点「发布」并确认真的发出去了（短信验证码那一路也在这里处理）。
+
+        为什么要单独抽出来：这段原来是 `while True` + 一个**没有保护的 retry 分支**，
+        而它出过的事故全是"重试路径自己把任务搞死"这一类——
+
+        * 确认窗口只有 3 秒（`wait_for_url(..., timeout=3000)`）：并行发多个平台时
+          请求排队，点完发布 3 秒没跳转是常态，那是"慢"不是"坏"；
+        * retry 分支里的调试截图层层放大：没有 path、没有自己的超时，而 Playwright
+          截图前要等 `document.fonts.ready`。实测 2026-09-29 17:15:42 那次就卡在这里，
+          等满 30 秒抛异常，异常从 `except` 冒出去——本可以重试成功的发布被判成
+          `Page.screenshot: Timeout 30000ms exceeded`（同一条任务第二轮 73 秒就成功了）；
+        * 循环本身没有总预算：平台真拦住时它会一直点下去，最后被 30 分钟看门狗判成
+          "卡住"，跟真相（发布被平台拒绝）对不上。
+
+        现在的契约：确认窗口 10 秒；取证截图有界、落盘、异常不外溢；
+        整个循环有一个总预算（`DOUYIN_PUBLISH_TIMEOUT_SECONDS`），超了才报失败。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DOUYIN_PUBLISH_TIMEOUT_SECONDS
+        last_error: Exception | None = None
         sms_code_requested = False   # 是否已经点过「获取验证码」（只点一次，避免限流）
         sms_skipped = False          # 用户点过「跳过」后，本轮不再反复弹窗
-        while True:
+
+        while loop.time() < deadline:
             try:
                 # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
                 await page.evaluate(
@@ -1154,22 +1229,27 @@ class DouYinVideo(DouYinBaseUploader):
                     await publish_button.click(force=True)
                 await page.wait_for_url(
                     "https://creator.douyin.com/creator-micro/content/manage**",
-                    timeout=3000,
+                    timeout=DOUYIN_PUBLISH_CONFIRM_TIMEOUT_MS,
                 )
                 douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
-                break
-            except Exception:
-                await self.handle_auto_video_cover(page)
+                return
+            except Exception as exc:
+                last_error = exc
+                # 收尾/补救动作也在这个 except 里，同样不许它把重试循环带走
+                try:
+                    await self.handle_auto_video_cover(page)
+                except Exception as cover_exc:  # noqa: BLE001
+                    douyin_logger.warning(_msg("😵", f"推荐封面没处理成功，继续重试发布: {cover_exc}"))
                 douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
                 if self.debug:
-                    await page.screenshot(full_page=True)
+                    await _debug_shot(page, "douyin-publish-retry")
                 await asyncio.sleep(0.5)
 
-        await context.storage_state(path=self.account_file)
-        douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
-        await asyncio.sleep(2)
-        await context.close()
-        await browser.close()
+        raise RuntimeError(
+            f"抖音发布连续重试 {DOUYIN_PUBLISH_TIMEOUT_SECONDS} 秒仍未确认成功，已停止重试。"
+            f"常见原因：平台拦住了这次发布（违规/风控/需要验证码），或者页面改版后"
+            f"成功跳转的 URL 变了。最后错误: {last_error}"
+        )
 
     async def douyin_upload_video(self):
         async with async_playwright() as playwright:
@@ -1275,7 +1355,7 @@ class DouYinNote(DouYinBaseUploader):
                     await publish_button.click()
                 await page.wait_for_url(
                     "**/creator-micro/content/manage?enter_from=publish**",
-                    timeout=3000,
+                    timeout=DOUYIN_PUBLISH_CONFIRM_TIMEOUT_MS,
                 )
                 douyin_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
                 break

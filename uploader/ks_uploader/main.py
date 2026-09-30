@@ -41,9 +41,123 @@ KUAISHOU_PUBLISH_ATTEMPTS = 3
 KUAISHOU_UPLOAD_ENTRY_TIMEOUT_MS = 60_000
 KUAISHOU_UPLOAD_ENTRY_ATTEMPTS = 2
 
+# 发布页首次导航（`goto`）的等待条件与预算。
+#
+# 原来写的是裸的 `await page.goto(KUAISHOU_UPLOAD_URL)`，也就是 Playwright 的默认值：
+# `wait_until="load"` + 30 秒。实测 2026-09-29 17:14:33（Web 端一次提交 3 个平台、
+# 每平台 2 条任务）为什么"每条通道的第一条任务必挂"：
+#   6 条任务同时入队，每个通道的第一条在同一秒启动 → 机器最冷的时刻同时拉起 3 个
+#   chromium（新进程、磁盘缓存冷、DNS/TLS 冷），CPU 又互相抢；等这轮跑完，后面的
+#   任务都是错开的、热缓存，所以只有第一条挨打。证据：同一条快手的 cookie 校验
+#   第一轮跑了 32 秒（17:14:34 → 17:15:06），紧接着的 `goto` 30 秒没等到 `load`
+#   就整条判死；第二轮同一个页面 `goto` 只用了 10 秒（17:16:00 → 17:16:10）。
+# 同一次提交里抖音那条用的是 `wait_until="domcontentloaded"` + 90 秒，它就没死在导航上。
+#
+# 所以这里对齐抖音，并且两点都要：
+#   1. `domcontentloaded`：`load` 还要等字体/图片/统计脚本，而"能不能开始操作页面"
+#      只取决于 DOM 建好没有——并发跑多个浏览器时这些子资源恰好是最慢的；
+#   2. 90 秒 + 失败重来一次：首次导航超时时页面上还什么都没有，重试没有任何副作用。
+KUAISHOU_NAV_TIMEOUT_MS = 90_000
+KUAISHOU_NAV_ATTEMPTS = 2
+
+# 发布重试时的现场截图预算。Playwright 截图前会等 `document.fonts.ready`
+# （日志里的 "waiting for fonts to load..."），机器忙的时候这个等待会一直撞到
+# 默认的 30 秒超时。取证用途的东西不值得让一次发布多等 30 秒，5 秒足够。
+KUAISHOU_DEBUG_SHOT_TIMEOUT_MS = 5_000
+
+# 失败取证的目录（.gitignore 里已忽略）。和小红书那条路统一，排障时只看一个地方。
+KUAISHOU_SCREENSHOT_DIR = "screenshots"
+
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+async def _debug_shot(page: Page, tag: str) -> str:
+    """发布重试时留一张现场全页截图，返回保存路径（失败返回空串）。
+
+    **这个函数自己绝不允许把任务搞失败。** 原来的写法是两个问题叠在一起：
+
+    1. 写的是 `await page.screenshot(full_page=True)`——**没有 path**，拿到的字节
+       当场丢掉，等于白跑一次全页截图，出事时什么证据都没留下；
+    2. 它没有自己的超时，而 Playwright 截图要等字体加载完。实测 2026-09-29
+       17:15:42 抖音那条就是被它判死的：点「发布」后 3 秒没跳转（那一刻另外两个
+       浏览器正在跑，属于"慢"不是"坏"），进入 retry 分支截图 → 等字体等满 30 秒
+       → 异常从 `except` 分支冒出去，把本可以重试成功的发布写成了
+       `Page.screenshot: Timeout 30000ms exceeded`。同一条任务第二轮 73 秒就发成功了。
+
+    取证是好事，但它必须**有界、落盘、且异常不外溢**。
+    """
+    import time
+    try:
+        base = Path(KUAISHOU_SCREENSHOT_DIR)
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.png"
+        await page.screenshot(
+            path=str(path), full_page=True, timeout=KUAISHOU_DEBUG_SHOT_TIMEOUT_MS
+        )
+        kuaishou_logger.warning(_msg("📸", f"已保存截图: {path}"))
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 —— 截图失败绝不能影响发布
+        kuaishou_logger.warning(_msg("📸", f"截图失败（不影响发布继续）: {exc}"))
+        return ""
+
+
+async def _goto_ks_page(
+    page: Page, url: str = KUAISHOU_UPLOAD_URL, *, what: str = "快手页面"
+) -> None:
+    """打开快手页面：显式 `domcontentloaded` + 90 秒，失败重来一次。
+
+    为什么不能继续用裸的 `page.goto(url)`，见 `KUAISHOU_NAV_TIMEOUT_MS` 的说明
+    ——默认的 `load` + 30 秒在"每条通道的第一条任务"上必然偏紧。
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, KUAISHOU_NAV_ATTEMPTS + 1):
+        try:
+            await page.goto(
+                url, wait_until="domcontentloaded", timeout=KUAISHOU_NAV_TIMEOUT_MS
+            )
+            if attempt > 1:
+                kuaishou_logger.warning(
+                    _msg("⚠️", f"{what}第 {attempt} 次导航才成功（首轮最慢，已自动恢复）")
+                )
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < KUAISHOU_NAV_ATTEMPTS:
+                kuaishou_logger.warning(
+                    _msg(
+                        "😵",
+                        f"{what}第 {attempt}/{KUAISHOU_NAV_ATTEMPTS} 次导航失败"
+                        f"（{KUAISHOU_NAV_TIMEOUT_MS / 1000:g} 秒没等到 domcontentloaded），"
+                        f"马上重试一次: {exc}",
+                    )
+                )
+                await asyncio.sleep(2)
+
+    raise RuntimeError(
+        f"打开{what}连续 {KUAISHOU_NAV_ATTEMPTS} 次导航失败"
+        f"（每次 {KUAISHOU_NAV_TIMEOUT_MS / 1000:g} 秒）。"
+        f"这多半是网络到 cp.kuaishou.com 不通，或机器被并发任务压住了——"
+        f"等其它任务跑完再发，或调小 SAU_MAX_CONCURRENT_BROWSERS 减少同时开的浏览器。"
+        f"最后错误: {last_error}"
+    )
+
+
+async def _wait_ks_upload_page(page: Page, timeout_ms: int = 30_000) -> None:
+    """确认真的停在快手发布页；被踹到登录页时给出可操作的错误。
+
+    不这么做的话，cookie 失效会表现为"等 URL 超时"，用户只能对着超时日志猜
+    ——而这两件事的处置完全不同（一个去重新登录，一个去查网络/页面）。
+    """
+    try:
+        await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN, timeout=timeout_ms)
+    except Exception as exc:
+        if "passport.kuaishou.com" in (page.url or ""):
+            raise RuntimeError(
+                "快手 cookie 已失效（发布页被跳到了登录页），请到「账号管理」重新登录快手后再发"
+            ) from exc
+        raise
 
 
 async def _dump_page_debug(page, tag: str) -> str:
@@ -53,7 +167,11 @@ async def _dump_page_debug(page, tag: str) -> str:
     base.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     try:
-        await page.screenshot(path=str(base / f"{tag}_{ts}.png"), full_page=True)
+        await page.screenshot(
+            path=str(base / f"{tag}_{ts}.png"),
+            full_page=True,
+            timeout=KUAISHOU_DEBUG_SHOT_TIMEOUT_MS,
+        )
     except Exception:
         pass
     try:
@@ -190,9 +308,11 @@ async def _wait_upload_entry(
             await on_retry()
         else:
             try:
-                await page.reload(wait_until="domcontentloaded")
+                await page.reload(
+                    wait_until="domcontentloaded", timeout=KUAISHOU_NAV_TIMEOUT_MS
+                )
             except Exception:
-                await page.goto(KUAISHOU_UPLOAD_URL)
+                await _goto_ks_page(page, what="快手发布页")
         await asyncio.sleep(2)
 
 
@@ -320,7 +440,7 @@ async def cookie_auth(account_file):
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await _goto_ks_page(page, what="快手发布页（cookie 校验）")
             await page.wait_for_timeout(3000)
 
             # 检查是否被重定向到登录页
@@ -401,7 +521,7 @@ async def get_ks_cookie(
         result = _build_login_result(False, "failed", "快手登录失败", account_file)
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_LOGIN_URL)
+            await _goto_ks_page(page, KUAISHOU_LOGIN_URL, what="快手登录页")
             kuaishou_logger.info(_msg("🧍", "请在浏览器里扫码登录快手，小人正在耐心等待"))
 
             qrcode_info = await _save_ks_qrcode(page, account_file, qrcode_callback=qrcode_callback)
@@ -728,10 +848,10 @@ class KSVideo(KSBaseUploader):
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await _goto_ks_page(page, what="快手上传主页")
             kuaishou_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手上传主页"))
-            await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
+            await _wait_ks_upload_page(page)
 
             upload_button = page.locator("button[class^='_upload-btn']")
             await _wait_upload_entry(page, upload_button, what="「上传视频」按钮")
@@ -822,7 +942,7 @@ class KSVideo(KSBaseUploader):
                         "🏃", f"小人正在冲刺发布视频（{attempt}/{KUAISHOU_PUBLISH_ATTEMPTS}）: {exc}"
                     ))
                     if self.debug:
-                        await page.screenshot(full_page=True)
+                        await _debug_shot(page, "ks-publish-retry")
                     await asyncio.sleep(1)
             else:
                 raise RuntimeError(
@@ -966,7 +1086,7 @@ class KSNote(KSBaseUploader):
             except Exception as exc:
                 kuaishou_logger.info(_msg("🏃", f"小人正在冲刺发布图文: {exc}"))
                 if self.debug:
-                    await page.screenshot(full_page=True)
+                    await _debug_shot(page, "ks-note-publish-retry")
                 await asyncio.sleep(1)
 
     async def upload(self, playwright: Playwright) -> None:
@@ -990,9 +1110,9 @@ class KSNote(KSBaseUploader):
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await _goto_ks_page(page, what="快手图文发布页")
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手图文发布页"))
-            await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
+            await _wait_ks_upload_page(page)
 
             await self.upload_note_content(page)
             upload_success = True

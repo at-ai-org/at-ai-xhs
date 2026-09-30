@@ -1,4 +1,5 @@
 import { http } from '@/utils/request'
+import { withToken } from '@/utils/session'
 
 // 小红书 Web 操作相关 API（at-ai-xhs 改造新增）
 // 后端路由前缀 /xhs，见 sau_backend_xhs.py
@@ -62,7 +63,7 @@ export const xhsApi = {
     return http.get('/xhs/tasks')
   },
 
-  // ---- 模型设置（OpenAI 兼容格式）----
+  // ---- 设置：视觉理解模型（OpenAI 兼容格式）----
 
   /** 读取设置（api_key 只返回掩码） */
   getSettings() {
@@ -105,9 +106,12 @@ export const xhsApi = {
   /**
    * 扫码登录的 SSE 地址。
    * 二维码与登录结果都由后端通过该连接推送（见 sau_backend_xhs.py 的 /xhs/login/stream）。
+   *
+   * `EventSource` 不能自定义请求头，所以登录态只能挂在查询串上（withToken）；
+   * 后端在 myUtils/web_auth.py 的 token_from() 里同时接受请求头和查询串。
    */
   loginStreamUrl(account) {
-    return `${API_BASE}/xhs/login/stream?account=${encodeURIComponent(account)}`
+    return withToken(`${API_BASE}/xhs/login/stream?account=${encodeURIComponent(account)}`)
   }
 }
 

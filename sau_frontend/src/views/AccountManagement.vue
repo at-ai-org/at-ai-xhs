@@ -19,6 +19,9 @@
               />
               <div class="action-buttons">
                 <el-button type="primary" @click="handleAddAccount">添加账号</el-button>
+                <!-- 定时续期开关：到点后由后端给下面这些账号逐个续一次会话，避免悄悄掉线。
+                     组件自带状态（两页共享一份），设置页里也能开关同一件事。 -->
+                <SessionRenewToggle />
                 <el-button type="info" @click="fetchAccounts" :loading="false">
                   <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
                   <span v-if="appStore.isAccountRefreshing">刷新中</span>
@@ -61,6 +64,18 @@
                 </el-table-column>
                 <el-table-column label="操作">
                   <template #default="scope">
+                    <!-- 异常账号的补救入口：不用先去点那个红色状态标签，这里直接重新授权一次。
+                         只在异常时出现——正常账号没有重新扫码的必要，按钮常驻反而会让人误点，
+                         而重新扫码会把当前登录态顶掉。 -->
+                    <el-button
+                      v-if="needsRelogin(scope.row.status)"
+                      size="small"
+                      type="warning"
+                      :icon="Refresh"
+                      @click="handleReLogin(scope.row)"
+                    >
+                      重新扫码
+                    </el-button>
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -89,6 +104,9 @@
               />
               <div class="action-buttons">
                 <el-button type="primary" @click="handleAddAccount">添加账号</el-button>
+                <!-- 定时续期开关：到点后由后端给下面这些账号逐个续一次会话，避免悄悄掉线。
+                     组件自带状态（两页共享一份），设置页里也能开关同一件事。 -->
+                <SessionRenewToggle />
                 <el-button type="info" @click="fetchAccounts" :loading="false">
                   <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
                   <span v-if="appStore.isAccountRefreshing">刷新中</span>
@@ -131,6 +149,18 @@
                 </el-table-column>
                 <el-table-column label="操作">
                   <template #default="scope">
+                    <!-- 异常账号的补救入口：不用先去点那个红色状态标签，这里直接重新授权一次。
+                         只在异常时出现——正常账号没有重新扫码的必要，按钮常驻反而会让人误点，
+                         而重新扫码会把当前登录态顶掉。 -->
+                    <el-button
+                      v-if="needsRelogin(scope.row.status)"
+                      size="small"
+                      type="warning"
+                      :icon="Refresh"
+                      @click="handleReLogin(scope.row)"
+                    >
+                      重新扫码
+                    </el-button>
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -159,6 +189,9 @@
               />
               <div class="action-buttons">
                 <el-button type="primary" @click="handleAddAccount">添加账号</el-button>
+                <!-- 定时续期开关：到点后由后端给下面这些账号逐个续一次会话，避免悄悄掉线。
+                     组件自带状态（两页共享一份），设置页里也能开关同一件事。 -->
+                <SessionRenewToggle />
                 <el-button type="info" @click="fetchAccounts" :loading="false">
                   <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
                   <span v-if="appStore.isAccountRefreshing">刷新中</span>
@@ -201,6 +234,18 @@
                 </el-table-column>
                 <el-table-column label="操作">
                   <template #default="scope">
+                    <!-- 异常账号的补救入口：不用先去点那个红色状态标签，这里直接重新授权一次。
+                         只在异常时出现——正常账号没有重新扫码的必要，按钮常驻反而会让人误点，
+                         而重新扫码会把当前登录态顶掉。 -->
+                    <el-button
+                      v-if="needsRelogin(scope.row.status)"
+                      size="small"
+                      type="warning"
+                      :icon="Refresh"
+                      @click="handleReLogin(scope.row)"
+                    >
+                      重新扫码
+                    </el-button>
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -229,6 +274,9 @@
               />
               <div class="action-buttons">
                 <el-button type="primary" @click="handleAddAccount">添加账号</el-button>
+                <!-- 定时续期开关：到点后由后端给下面这些账号逐个续一次会话，避免悄悄掉线。
+                     组件自带状态（两页共享一份），设置页里也能开关同一件事。 -->
+                <SessionRenewToggle />
                 <el-button type="info" @click="fetchAccounts" :loading="false">
                   <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
                   <span v-if="appStore.isAccountRefreshing">刷新中</span>
@@ -271,6 +319,18 @@
                 </el-table-column>
                 <el-table-column label="操作">
                   <template #default="scope">
+                    <!-- 异常账号的补救入口：不用先去点那个红色状态标签，这里直接重新授权一次。
+                         只在异常时出现——正常账号没有重新扫码的必要，按钮常驻反而会让人误点，
+                         而重新扫码会把当前登录态顶掉。 -->
+                    <el-button
+                      v-if="needsRelogin(scope.row.status)"
+                      size="small"
+                      type="warning"
+                      :icon="Refresh"
+                      @click="handleReLogin(scope.row)"
+                    >
+                      重新扫码
+                    </el-button>
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -299,6 +359,9 @@
               />
               <div class="action-buttons">
                 <el-button type="primary" @click="handleAddAccount">添加账号</el-button>
+                <!-- 定时续期开关：到点后由后端给下面这些账号逐个续一次会话，避免悄悄掉线。
+                     组件自带状态（两页共享一份），设置页里也能开关同一件事。 -->
+                <SessionRenewToggle />
                 <el-button type="info" @click="fetchAccounts" :loading="false">
                   <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
                   <span v-if="appStore.isAccountRefreshing">刷新中</span>
@@ -341,6 +404,18 @@
                 </el-table-column>
                 <el-table-column label="操作">
                   <template #default="scope">
+                    <!-- 异常账号的补救入口：不用先去点那个红色状态标签，这里直接重新授权一次。
+                         只在异常时出现——正常账号没有重新扫码的必要，按钮常驻反而会让人误点，
+                         而重新扫码会把当前登录态顶掉。 -->
+                    <el-button
+                      v-if="needsRelogin(scope.row.status)"
+                      size="small"
+                      type="warning"
+                      :icon="Refresh"
+                      @click="handleReLogin(scope.row)"
+                    >
+                      重新扫码
+                    </el-button>
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -361,7 +436,7 @@
     <!-- 添加/编辑账号对话框 -->
     <el-dialog
       v-model="dialogVisible"
-      :title="dialogType === 'add' ? '添加账号' : '编辑账号'"
+      :title="reloginMode ? '重新扫码授权' : (dialogType === 'add' ? '添加账号' : '编辑账号')"
       width="500px"
       :close-on-click-modal="false"
       :close-on-press-escape="!sseConnecting"
@@ -445,6 +520,10 @@ import { accountApi } from '@/api/account'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { http } from '@/utils/request'
+import { withToken } from '@/utils/session'
+// 「定时续期」开关（放在「添加账号」旁边）。状态与「设置」页共享，
+// 见 composables/useSessionRenew.js 里关于"为什么不做成 5 份各自的状态"的说明。
+import SessionRenewToggle from '@/components/SessionRenewToggle.vue'
 
 // 获取账号状态管理
 const accountStore = useAccountStore()
@@ -538,10 +617,15 @@ const getPlatformTagType = (platform) => {
   return typeMap[platform] || 'info'
 }
 
-// 判断状态是否可点击（异常状态可点击）
-const isStatusClickable = (status) => {
-  return status === '异常'; // 只有异常状态可点击，验证中不可点击
-}
+// 账号是否需要重新授权。
+// 只有「异常」这一档需要：它是 cookie 真失效了。「验证中」不算——它只是校验还没跑完，
+// 这时候去重新扫码反而是多余的，还会把正在校验的会话顶掉。
+const needsRelogin = (status) => status === '异常'
+
+// 判断状态标签是否可点击：等价于"这个状态能触发重新登录"。
+// 收成同一个判断，是为了别让「异常」这个字面量散落到模板各处——改状态名时漏改一处，
+// 就会出现"标签点得动、按钮不出现"这类不一致。
+const isStatusClickable = (status) => needsRelogin(status)
 
 // 获取状态标签类型
 const getStatusTagType = (status) => {
@@ -595,6 +679,9 @@ const handleSearch = () => {
 // 对话框相关
 const dialogVisible = ref(false)
 const dialogType = ref('add') // 'add' 或 'edit'
+// 是否由「重新扫码」按钮发起。与 dialogType 正交：重新扫码走的仍是 edit 那套
+// （平台/名称锁住不改），只是标题和文案要说"重新扫码"，别让用户以为自己在改资料。
+const reloginMode = ref(false)
 const accountFormRef = ref(null)
 
 // 账号表单
@@ -620,6 +707,7 @@ const loginStatus = ref('')
 // 添加账号
 const handleAddAccount = () => {
   dialogType.value = 'add'
+  reloginMode.value = false
   Object.assign(accountForm, {
     id: null,
     name: '',
@@ -637,6 +725,7 @@ const handleAddAccount = () => {
 // 编辑账号
 const handleEdit = (row) => {
   dialogType.value = 'edit'
+  reloginMode.value = false
   Object.assign(accountForm, {
     id: row.id,
     name: row.name,
@@ -742,10 +831,11 @@ const handleUploadCookie = (row) => {
   input.click()
 }
 
-// 重新登录账号
+// 重新登录账号（异常账号的「重新扫码」按钮，以及点状态标签都走这里）
 const handleReLogin = (row) => {
-  // 设置表单信息
+  // 设置表单信息：平台和名称锁住不改，只换登录态
   dialogType.value = 'edit'
+  reloginMode.value = true
   Object.assign(accountForm, {
     id: row.id,
     name: row.name,
@@ -753,9 +843,10 @@ const handleReLogin = (row) => {
     status: row.status
   })
 
-  // 重置SSE状态
+  // 重置SSE状态（loginHint 也要清：上次失败的原因不该留在这次的扫码框上面）
   sseConnecting.value = false
   qrCodeData.value = ''
+  loginHint.value = ''
   loginStatus.value = ''
 
   // 显示对话框
@@ -805,8 +896,9 @@ const connectSSE = (platform, name) => {
   const type = platformTypeMap[platform] || '1'
 
   // 创建SSE连接
+  // EventSource 不能自定义请求头，登录态只能走查询串（见 utils/session.js 的 withToken）
   const baseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
-  const url = `${baseUrl}/login?type=${type}&id=${encodeURIComponent(name)}`
+  const url = withToken(`${baseUrl}/login?type=${type}&id=${encodeURIComponent(name)}`)
 
   // 每次新连接都清一次，避免上一次的提示串到这一次
   qrCodeData.value = ''

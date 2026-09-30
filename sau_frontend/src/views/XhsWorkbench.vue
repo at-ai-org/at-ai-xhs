@@ -320,7 +320,7 @@
         :closable="false"
         show-icon
         title="点「确认发布」后才会真正执行——之前不会发布任何内容"
-        description="下面是 AI 生成的文案，可以直接改。确认后将驱动浏览器完成上传与发布；被风控提示时，改点「有头浏览器发布」重跑。"
+        description="下面是 AI 生成的文案，可以直接改——改成你自己的话比什么都重要。确认后会在本机弹出浏览器窗口完成上传与发布。"
       />
       <el-form label-width="90px" class="mt12">
         <el-form-item label="标题">
@@ -329,7 +329,7 @@
         <el-form-item label="正文">
           <el-input v-model="confirmForm.desc" type="textarea" :rows="7" maxlength="1000" show-word-limit />
           <div class="hint">
-            AI 按 {{ descMaxChars }} 字以内生成（可在「模型设置」里调）。
+            AI 按 {{ descMaxChars }} 字以内生成（可在「设置」里调）。
             <span v-if="confirmForm.desc.length > descMaxChars" class="over-limit">
               当前 {{ confirmForm.desc.length }} 字，已超出目标长度
             </span>
@@ -373,8 +373,9 @@
       <div class="mode-box">
         <div class="mode-title">浏览器模式</div>
         <div class="hint">
-          <b>无头</b>：不弹窗口、跑得快，但更容易被平台风控提示（「操作过于频繁」等）。<br />
-          <b>有头</b>：在本机弹出真实浏览器窗口，全程可见、更像真人操作，<b>被风控提示时优先用它重跑</b>。
+          <b>有头（固定）</b>：发布时在本机弹出真实浏览器窗口，全程可见。
+          无头发布已移除——平台明确禁止"利用技术手段模拟真人"，无头是这条链路上最扎眼的
+          行为特征，也是最容易被判定为「AI 托管」的触发点。<br />
           发布期间请不要关闭/最小化那个窗口，也不要手动点页面上的按钮。
         </div>
       </div>
@@ -382,20 +383,12 @@
       <template #footer>
         <el-button :disabled="!!confirmingMode" @click="confirmVisible = false">再想想</el-button>
         <el-button
-          type="primary"
-          :loading="confirmingMode === 'headless'"
-          :disabled="confirmingMode === 'headed'"
-          @click="doConfirm('headless')"
-        >
-          确认发布（无头）
-        </el-button>
-        <el-button
           type="success"
           :loading="confirmingMode === 'headed'"
-          :disabled="confirmingMode === 'headless'"
+          :disabled="!!confirmingMode"
           @click="doConfirm('headed')"
         >
-          有头浏览器发布
+          确认发布（有头浏览器）
         </el-button>
       </template>
     </el-dialog>
@@ -437,7 +430,7 @@ const task = ref(null)
 
 // 二次确认
 const confirmVisible = ref(false)
-// 正在确认的是哪一档：'' | 'headless' | 'headed'（两个按钮各自转各自的 loading）
+// 确认按钮的 loading 状态：'' | 'headed'（只剩有头一档）
 const confirmingMode = ref('')
 const confirmTaskId = ref('')
 const confirmForm = ref({
@@ -505,11 +498,10 @@ const stepTagType = (status) => {
   return 'warning'
 }
 
-/** 浏览器模式在点「确认发布」那一刻才定，所以确认前不显示具体值 */
+/** 发布一律走有头（无头档已移除），所以这里不再有"确认时选"的中间态 */
 function browserModeLabel(row) {
   if (!row || row.state === 'cancelled') return '-'
-  if (row.state === 'analyzing' || row.state === 'pending_confirm') return '确认时选'
-  return row.headless === false ? '有头' : '无头'
+  return '有头'
 }
 
 async function loadAccounts() {
@@ -741,14 +733,14 @@ function openConfirm(row) {
 
 /**
  * 二次确认 → 后端才真正执行发布。
- * mode: 'headless'（默认，不弹窗口）| 'headed'（本机弹窗，被风控提示时用）
+ * 模式固定为 'headed'（本机弹窗）。无头发布已移除：平台明确禁止"利用技术手段模拟真人"，
+ * 无头是发布链路上最扎眼的行为特征。后端也会强制覆盖，这里传的值只是保持一致。
  */
-async function doConfirm(mode = 'headless') {
+async function doConfirm(mode = 'headed') {
   if (!confirmForm.value.title.trim()) {
     ElMessage.warning('标题不能为空')
     return
   }
-  const headed = mode === 'headed'
   confirmingMode.value = mode
   try {
     const res = await xhsApi.confirmTask(confirmTaskId.value, {
@@ -763,16 +755,12 @@ async function doConfirm(mode = 'headless') {
       schedule: confirmForm.value.schedule || null,
       original: confirmForm.value.original,
       dry_run: confirmForm.value.dry_run,
-      // 浏览器模式在确认这一刻才定下来，后端据此决定要不要弹窗口
-      headless: !headed
+      // 固定有头；后端同样会强制覆盖成有头，两边一致
+      headless: false
     })
     if (res.code === 200) {
       confirmVisible.value = false
-      ElMessage.success(
-        headed
-          ? '已确认，正在执行发布（有头模式：本机会弹出浏览器窗口，请不要关闭它）'
-          : '已确认，正在执行发布'
-      )
+      ElMessage.success('已确认，正在执行发布（本机会弹出浏览器窗口，请不要关闭它）')
       await loadTasks()
       startPolling()
     }
@@ -813,7 +801,7 @@ async function loadDefaults() {
     const res = await xhsApi.getDefaults()
     if (res.code === 200) {
       defaultCollection.value = res.data?.default_collection || ''
-      // 正文字数上限来自模型设置，用于在确认弹窗里提示
+      // 正文字数上限来自「设置」页的模型配置，用于在确认弹窗里提示
       try {
         const s = await xhsApi.getSettings()
         if (s.code === 200) descMaxChars.value = s.data?.vision?.desc_max_chars || 100

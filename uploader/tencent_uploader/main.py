@@ -14,9 +14,19 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
-from utils.base_social_media import set_init_script
+# 视频号会话层：持久化 profile + 每条路径回写 cookie + 登录/校验/发布共用启动参数。
+# 登录、校验、发布三处都必须走它，不要再自己 launch + new_context —— 那正是
+# 「扫码当晚有效、第二天服务端已作废而本地文件还一无所知」的成因。
+from uploader.tencent_uploader.session import (
+    TENCENT_HEADLESS,
+    discard_profile,
+    finalize_login_profile,
+    profile_dir_for,
+    save_storage_state,
+    tencent_session,
+)
 from utils.log import tencent_logger
 
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
@@ -69,15 +79,6 @@ def _build_login_result(
     }
 
 
-def _build_launch_kwargs(headless: bool) -> dict:
-    launch_kwargs = {"headless": headless}
-    if LOCAL_CHROME_PATH:
-        launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
-    else:
-        launch_kwargs["channel"] = "chrome"
-    return launch_kwargs
-
-
 def _get_qrcode_utils():
     from utils.login_qrcode import build_login_qrcode_path
     from utils.login_qrcode import decode_qrcode_from_path
@@ -111,38 +112,45 @@ def format_str_for_short_title(origin_title: str) -> str:
     return formatted_string
 
 
-async def cookie_auth(account_file):
+async def cookie_auth(account_file, headless: bool | None = None):
+    """校验视频号登录态。**唯一**的校验入口（账号列表、发布前置检查都走它）。
+
+    以前这里是「一次性 new_context + 固定 headless=True」：一来不开持久化 profile，
+    和发布用的不是同一台"设备"；二来校验过程中服务端下发的任何新 cookie 都被丢掉，
+    校验完就随浏览器一起销毁了。现在走 session 层：同一个 profile、同一个无头开关
+    （conf.TENCENT_HEADLESS，有头/无头做 A/B），并且**失败、异常也回写 cookie**。
+    """
     account_file = _resolve_account_file(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
         try:
-            context = await browser.new_context(storage_state=account_file)
-            context = await set_init_script(context)
-            page = await context.new_page()
-            await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
+            # fallback_when_busy：账号管理页每次刷新都逐个账号校验，而这个账号可能正在
+            # 发布（profile 一占就是几分钟）——那种情况下降级成只读探测，不排队干等。
+            async with tencent_session(
+                playwright, account_file, headless=headless, fallback_when_busy=True
+            ) as session:
+                page = await session.context.new_page()
+                await page.goto(TENCENT_UPLOAD_URL, wait_until="domcontentloaded")
 
-            # cookie 失效时, 页面先停在 post/create, 随后由前端 JS 跳转到登录页;
-            # 必须等待跳转完成再判断, 否则会误报"cookie 有效"
-            try:
-                await page.wait_for_url("**/login.html**", timeout=8000)
-                tencent_logger.info(_msg("🥹", "cookie 已失效（页面跳转到登录页），得重新登录一下"))
-                return False
-            except Exception:
-                pass  # 8 秒内未跳转, 大概率已登录
-
-            # 双保险: 页面里出现微信扫码登录 iframe 也视为失效
-            for fr in page.frames:
-                if "open.weixin.qq.com/connect/qrconnect" in fr.url:
-                    tencent_logger.info(_msg("🥹", "cookie 已失效（页面出现扫码登录框），得重新登录一下"))
+                # cookie 失效时, 页面先停在 post/create, 随后由前端 JS 跳转到登录页;
+                # 必须等待跳转完成再判断, 否则会误报"cookie 有效"
+                try:
+                    await page.wait_for_url("**/login.html**", timeout=8000)
+                    tencent_logger.info(_msg("🥹", "cookie 已失效（页面跳转到登录页），得重新登录一下"))
                     return False
+                except Exception:
+                    pass  # 8 秒内未跳转, 大概率已登录
 
-            tencent_logger.success(_msg("🥳", "cookie 有效"))
-            return True
+                # 双保险: 页面里出现微信扫码登录 iframe 也视为失效
+                for fr in page.frames:
+                    if "open.weixin.qq.com/connect/qrconnect" in fr.url:
+                        tencent_logger.info(_msg("🥹", "cookie 已失效（页面出现扫码登录框），得重新登录一下"))
+                        return False
+
+                tencent_logger.success(_msg("🥳", "cookie 有效"))
+                return True
         except Exception as exc:
             tencent_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
-        finally:
-            await browser.close()
 
 
 async def _extract_tencent_qrcode_src(page: Page) -> str:
@@ -386,40 +394,92 @@ async def tencent_cookie_gen(
     qrcode_callback=None,
     poll_interval: int = 3,
     max_checks: int = 100,
-    headless: bool = LOCAL_CHROME_HEADLESS,
+    headless: bool = TENCENT_HEADLESS,
 ):
     account_file = _resolve_account_file(account_file)
     Path(account_file).parent.mkdir(parents=True, exist_ok=True)
 
+    # 这个账号以前登录过（账号文件 + profile 都在）→ 直接在它自己的"设备"上重登；
+    # 否则用全新的临时 profile，登录成功后再归位到 uin_<wxuin>（见 finalize_login_profile）。
+    existing_profile = Path(profile_dir_for(account_file)) if os.path.exists(account_file) else None
+    reuse = bool(existing_profile and existing_profile.exists())
+    if reuse:
+        tencent_logger.info(_msg("♻️", f"复用已有浏览器 profile: {existing_profile.name}"))
+
+    staging: Path | None = existing_profile if reuse else None
+    qrcode_info = None
+    current_url = ""
+    result = _build_login_result(False, "failed", "视频号登录失败", account_file)
+
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=headless))
-        context = await browser.new_context()
-        qrcode_path = None
-        result = _build_login_result(False, "failed", "视频号登录失败", account_file)
         try:
-            page = await context.new_page()
-            await page.goto(TENCENT_LOGIN_URL)
-            try:
-                qrcode_info = await _save_tencent_qrcode(page, account_file, qrcode_callback=qrcode_callback)
-                qrcode_path = Path(qrcode_info["image_path"])
-            except Exception as exc:
-                tencent_logger.warning(
-                    _msg("⚠️", f"提取二维码图片失败({exc})，请直接在弹出的浏览器窗口中扫码，登录流程不受影响")
-                )
-                qrcode_info = None
+            async with tencent_session(
+                playwright,
+                account_file if reuse else None,
+                profile_dir=existing_profile if reuse else None,
+                seed=reuse,
+                # 登录途中不碰账号文件：只有确认登录成功才由下面显式回写，
+                # 免得一次失败的扫码把原来还能用的账号文件覆盖掉。
+                persist=False,
+                headless=headless,
+            ) as session:
+                staging = session.profile_dir
+                context = session.context
                 qrcode_path = None
-            tencent_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
-            result = await _wait_for_tencent_login(
-                page,
-                account_file,
-                qrcode_info,
-                qrcode_callback=qrcode_callback,
-                poll_interval=poll_interval,
-                max_checks=max_checks,
-            )
+                page = None
+
+                def _current_url() -> str:
+                    try:
+                        return page.url if page is not None else ""
+                    except Exception:
+                        return ""
+
+                try:
+                    page = await context.new_page()
+                    await page.goto(TENCENT_LOGIN_URL)
+                    try:
+                        qrcode_info = await _save_tencent_qrcode(page, account_file, qrcode_callback=qrcode_callback)
+                        qrcode_path = Path(qrcode_info["image_path"])
+                    except Exception as exc:
+                        tencent_logger.warning(
+                            _msg("⚠️", f"提取二维码图片失败({exc})，请直接在弹出的浏览器窗口中扫码，登录流程不受影响")
+                        )
+                        qrcode_info = None
+                        qrcode_path = None
+                    tencent_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
+                    result = await _wait_for_tencent_login(
+                        page,
+                        account_file,
+                        qrcode_info,
+                        qrcode_callback=qrcode_callback,
+                        poll_interval=poll_interval,
+                        max_checks=max_checks,
+                    )
+                    if result["success"]:
+                        await asyncio.sleep(2)
+                        if not await save_storage_state(context, account_file):
+                            result = _build_login_result(
+                                False,
+                                "failed",
+                                "扫码成功，但 cookie 没能写进账号文件",
+                                account_file,
+                                qrcode_info,
+                                _current_url(),
+                            )
+                except Exception as exc:
+                    result = _build_login_result(False, "failed", str(exc), account_file, current_url=_current_url())
+                finally:
+                    current_url = _current_url()
+                    qrcode_utils = _get_qrcode_utils()
+                    if qrcode_utils["remove_qrcode_file"](qrcode_path):
+                        tencent_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
+
+            # ↓ 浏览器已关闭、profile 目录已释放，下面这几步必须在块外做：
+            #   * 归位 profile（改名要等 Chrome 放开目录）；
+            #   * 校验登录态（校验要再开一个浏览器，同一个 profile 目录同时只能有一个 Chrome）。
             if result["success"]:
-                await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
+                if not reuse:
+                    finalize_login_profile(account_file, staging)
                 if not await cookie_auth(account_file):
                     result = _build_login_result(
                         False,
@@ -427,26 +487,21 @@ async def tencent_cookie_gen(
                         "视频号扫码流程结束，但 cookie 校验失败",
                         account_file,
                         qrcode_info,
-                        page.url,
+                        current_url,
                     )
-            return result
+            elif not reuse:
+                # 登录失败：临时 profile 不留，否则 cookies/tencent_uploader/ 会堆一堆垃圾
+                discard_profile(staging)
         except Exception as exc:
-            result = _build_login_result(
-                False,
-                "failed",
-                str(exc),
-                account_file,
-                current_url=page.url if "page" in locals() else "",
-            )
-            return result
-        finally:
-            qrcode_utils = _get_qrcode_utils()
-            if qrcode_utils["remove_qrcode_file"](qrcode_path):
-                tencent_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
-            if not result["success"]:
-                tencent_logger.error(_msg("😢", f"登录失败: {result['message']}"))
-            await context.close()
-            await browser.close()
+            # 起浏览器就失败、或块外步骤出错：照样返回一个失败结果（调用方靠它判断），
+            # 不要把异常抛给 CLI / Web 后端
+            result = _build_login_result(False, "failed", str(exc), account_file, current_url=current_url)
+            if not reuse:
+                discard_profile(staging)
+
+    if not result["success"]:
+        tencent_logger.error(_msg("😢", f"登录失败: {result['message']}"))
+    return result
 
 
 async def tencent_setup(
@@ -454,7 +509,7 @@ async def tencent_setup(
     handle=False,
     return_detail=False,
     qrcode_callback=None,
-    headless: bool = LOCAL_CHROME_HEADLESS,
+    headless: bool = TENCENT_HEADLESS,
 ):
     account_file = _resolve_account_file(account_file)
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
@@ -470,7 +525,7 @@ async def tencent_setup(
     return result if return_detail else True
 
 
-async def get_tencent_cookie(account_file, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
+async def get_tencent_cookie(account_file, qrcode_callback=None, headless: bool = TENCENT_HEADLESS):
     return await tencent_cookie_gen(account_file, qrcode_callback=qrcode_callback, headless=headless)
 
 
@@ -479,7 +534,7 @@ async def weixin_setup(
     handle=False,
     return_detail=False,
     qrcode_callback=None,
-    headless: bool = LOCAL_CHROME_HEADLESS,
+    headless: bool = TENCENT_HEADLESS,
 ):
     return await tencent_setup(
         account_file,
@@ -497,7 +552,7 @@ class TencentBaseUploader(BaseVideoUploader):
         account_file,
         publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
-        headless: bool = LOCAL_CHROME_HEADLESS,
+        headless: bool = TENCENT_HEADLESS,
         collection_name: str | None = None,
         content_label: str | None = None,
     ):
@@ -968,7 +1023,7 @@ class TencentVideo(TencentBaseUploader):
         short_title: str | None = None,
         publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
-        headless: bool = LOCAL_CHROME_HEADLESS,
+        headless: bool = TENCENT_HEADLESS,
         collection_name: str | None = None,
         content_label: str | None = None,
     ):
@@ -1124,10 +1179,10 @@ class TencentVideo(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
-
-        try:
+        # 持久化 profile（按微信号）+ 退出时回写 cookie 都在 tencent_session 里：
+        # 成功、失败、异常都会回写，服务端下发的任何新票据都不会丢。
+        async with tencent_session(playwright, self.account_file, headless=self.headless) as session:
+            context = session.context
             page = await context.new_page()
             await self.open_upload_page(page)
             tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
@@ -1145,12 +1200,7 @@ class TencentVideo(TencentBaseUploader):
 
             await self.set_short_title(page, self.title, self.short_title)
             await self.submit_publish(page)
-
-            await context.storage_state(path=self.account_file)
-            tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
-        finally:
-            await context.close()
-            await browser.close()
+        tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
 
     async def tencent_upload_video(self):
         async with async_playwright() as playwright:
@@ -1171,7 +1221,7 @@ class TencentNote(TencentBaseUploader):
         title: str | None = None,
         publish_strategy: str = TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
-        headless: bool = LOCAL_CHROME_HEADLESS,
+        headless: bool = TENCENT_HEADLESS,
         is_draft: bool = False,
         content_label: str | None = None,
     ):
@@ -1232,11 +1282,10 @@ class TencentNote(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
-        context = await set_init_script(context)
-
-        try:
+        # 防检测脚本现在由 tencent_session 统一注入（以前只有图文这条加了，
+        # 视频那条没加——同一个 cookie 在两种指纹下使用是要避免的事）。
+        async with tencent_session(playwright, self.account_file, headless=self.headless) as session:
+            context = session.context
             page = await context.new_page()
             await self.open_upload_page(page)
             tencent_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
@@ -1247,12 +1296,7 @@ class TencentNote(TencentBaseUploader):
                 await self.set_schedule_time_tencent(page, self.publish_date)
 
             await self.submit_publish(page)
-
-            await context.storage_state(path=self.account_file)
-            tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
-        finally:
-            await context.close()
-            await browser.close()
+        tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
 
     async def tencent_upload_note(self):
         async with async_playwright() as playwright:

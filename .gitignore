@@ -98,6 +98,8 @@ desktop.ini
 *.swo
 *.tmp
 *.bak
+# 带时间戳的备份（tools/dedupe_accounts.py 等自动备份脚本产出，如 database.db.bak-20260928-115635）
+*.bak-*
 *.orig
 *.rej
 
@@ -141,6 +143,8 @@ cookies
 cookiesFile
 uploadFile
 videoFile
+# 背景音乐（用户上传的音乐本体，和素材一样是本地资产，不入库）
+bgmFile
 
 # 上传过程中生成的登录二维码
 **/qrcode.png
@@ -149,8 +153,8 @@ videoFile
 # ③ 本项目运行产物与敏感文件
 # ------------------------------------------------------------
 
-# 【敏感】模型配置：含**明文 API Key**，绝对不能提交
-model_settings.json
+# 【敏感】应用配置：含**明文 API Key** 和**后台登录密码**，绝对不能提交
+settings.json
 
 # 【敏感】账号凭据 / 登录态
 accounts.ini
@@ -178,6 +182,10 @@ logs/
 # 本地素材与调试截图（体积大，不入库）
 screenshots/
 videos/
+
+# 快手发布入口找不到时抓的现场（页面 HTML + 截图）。运行时产物，见
+# uploader/ks_uploader/main.py 的 _dump_page_debug()
+ks_debug/
 
 # 登录过程中生成的临时二维码图片
 cookiesFile/*_login_qrcode_*.png

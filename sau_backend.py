@@ -13,6 +13,7 @@ from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
 from werkzeug.utils import secure_filename
 from conf import BASE_DIR
+from myUtils import publish_records
 from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen
 from myUtils.postVideo import post_video_tencent, post_video_DouYin, post_video_ks, post_video_xhs
 # at-ai-xhs 改造新增：小红书网页操作接口（扫码登录 / 契约自检 / 合集列表 / 发布）
@@ -21,6 +22,26 @@ from myUtils.postVideo import post_video_tencent, post_video_DouYin, post_video_
 from sau_backend_xhs import xhs_bp, all_material_copies, delete_material_copy
 # at-ai-xhs 改造新增：发布中心（多平台批量发布的实时进度 + 发布记录）
 from sau_backend_publish import publish_bp
+# at-ai-xhs 改造新增：背景音乐（上传音乐 / 给素材换音轨）
+# bgm_status_map：素材管理的「背景音乐」列（待合成/合成中/已合成）就靠它
+# delete_bgm_status：删素材时把状态行一起清掉，否则会在下一个同名素材上"复活"
+from sau_backend_music import music_bp
+from myUtils.background_music import (
+    delete_status as delete_bgm_status,
+    ensure_music_tables,
+    reset_stale_statuses as reset_bgm_stale_statuses,
+    status_map as bgm_status_map,
+)
+# at-ai-xhs 改造新增：后台登录认证（账号 admin + 随机密码，密码存 settings.json）
+# install() 会挂上 /auth/login、/auth/status，并注册一个全局 before_request 守卫，
+# 把**除页面外壳和静态资源以外**的所有请求都挡在登录之后。详见 myUtils/web_auth.py。
+from myUtils import web_auth
+# at-ai-xhs 改造新增：账号会话定时续期（默认 0/7/14/20 点，可在「设置」里改或关掉）。
+# session_bp 是它的 Web 接口（/session-renew），调度线程只在 __main__ 里启动
+# （见文件末尾），import 阶段不起线程——否则任何 import 了本模块的调试脚本
+# 都会顺手开一个后台调度器。
+from myUtils import session_renew
+from sau_backend_session import session_bp
 
 active_queues = {}
 app = Flask(__name__)
@@ -33,6 +54,22 @@ app.register_blueprint(xhs_bp)
 
 # at-ai-xhs 改造新增：注册发布中心蓝图（/publish/*）
 app.register_blueprint(publish_bp)
+
+# at-ai-xhs 改造新增：注册背景音乐蓝图（/music/*）
+app.register_blueprint(music_bp)
+
+# at-ai-xhs 改造新增：注册账号会话续期蓝图（/session-renew）。
+# 单独一条路径而不是挂在 /xhs 下：续期的对象是「账号管理」里的**全部账号**，
+# 跟小红书无关，挂在 /xhs 下会让人以为只续小红书。
+app.register_blueprint(session_bp)
+
+# at-ai-xhs 改造新增：背景音乐那两张表兜底建一遍（老库不会重跑 db/createTable.py）
+ensure_music_tables()
+
+# at-ai-xhs 改造新增：启用登录认证。
+# 必须在所有蓝图注册完之后调用——守卫是按"拿到的是哪个端点"来判断放行的，
+# 蓝图没注册完就装，等于有些路由还没进 url_map。
+web_auth.install(app)
 
 # 限制上传文件大小。原值 160MB 传不了稍大的视频，小红书视频动辄几百 MB，
 # 这里放宽到 2GB（Flask 会在超限时直接返回 413）。
@@ -47,13 +84,22 @@ def custom_static(filename):
     return send_from_directory(os.path.join(current_dir, 'assets'), filename)
 
 # 处理 favicon.ico 静态资源（未来打包用）
+#
+# 这里其实回的是 SVG（内容是 logo.svg），所以**必须显式指定 mimetype**：
+# 靠文件名推断会得到 image/vnd.microsoft.icon，浏览器按 ICO 去解析 SVG 会失败。
+# 之所以不另外生成一份 .ico，是为了让"应用内 logo"和"标签页图标"永远是同一个文件
+# （public/logo.svg → dist/logo.svg → assets/logo.svg），不会哪天改了一个忘了另一个。
 @app.route('/favicon.ico')
 def favicon():
-    return send_from_directory(os.path.join(current_dir, 'assets'), 'vite.svg')
+    return send_from_directory(
+        os.path.join(current_dir, 'assets'), 'logo.svg', mimetype='image/svg+xml'
+    )
 
-@app.route('/vite.svg')
-def vite_svg():
-    return send_from_directory(os.path.join(current_dir, 'assets'), 'vite.svg')
+@app.route('/logo.svg')
+def logo_svg():
+    return send_from_directory(
+        os.path.join(current_dir, 'assets'), 'logo.svg', mimetype='image/svg+xml'
+    )
 
 # （未来打包用）
 @app.route('/')
@@ -236,6 +282,10 @@ def get_all_files():
         # 一次读全表再按 file_path 取，避免每行查一次库。
         copies = all_material_copies()
 
+        # 背景音乐状态：material_bgm 表同样以磁盘文件名为主键，见 myUtils/background_music.py。
+        # 没有记录 = 还没合成过（待合成）。
+        bgm_rows = bgm_status_map()
+
         # 将结果转为字典列表，并提取UUID
         data = []
         for row in rows:
@@ -261,6 +311,16 @@ def get_all_files():
             row_dict['tags'] = copy.get('tags') or []
             # updated_at 存的也是 UTC，同样转本地，否则显示会比实际早 8 小时
             row_dict['copy_updated_at'] = _utc_to_local(copy.get('updated_at'))
+
+            # 背景音乐：素材管理里那一列（放在 AI 文案之后）显示
+            # 待合成 / 合成中 / 已合成——缺记录就是待合成，和 /music/statuses 同一套口径。
+            bgm_row = bgm_rows.get(row_dict.get('file_path') or '') or {}
+            row_dict['bgm_status'] = bgm_row.get('status') or 'pending'
+            row_dict['bgm_status_text'] = bgm_row.get('status_text') or '待合成'
+            row_dict['bgm_music'] = bgm_row.get('music_name') or ''
+            row_dict['bgm_progress'] = int(bgm_row.get('progress') or 0)
+            # 合成失败时状态仍然是「待合成」，失败原因放这儿由前端 tooltip 展示
+            row_dict['bgm_message'] = bgm_row.get('message') or ''
             data.append(row_dict)
 
         return jsonify({
@@ -387,6 +447,10 @@ def delete_file():
         # AI 文案跟着素材一起删：material_copy 以文件名为 key，留着会在下一个
         # 同名素材上冒出来（现在文件名就是标题，重名很常见）。
         delete_material_copy(record['file_path'])
+
+        # 背景音乐状态同理：不删的话，下一个同名素材一进来就显示成「已合成」，
+        # 但它其实压根没换过音轨。
+        delete_bgm_status(record['file_path'])
 
         return jsonify({
             "code": 200,
@@ -823,4 +887,39 @@ def sse_stream(status_queue):
             time.sleep(0.1)
 
 if __name__ == '__main__':
+    # 启动时收尾（数据修正只在这里做，见 myUtils/publish_records.py 的说明）：
+    #   * 补 `source` 为空的老记录；
+    #   * 把上次进程被 Ctrl-C / 重启打断后留在「排队中/发布中」的僵尸记录标成「已中断」
+    #     ——此刻内存里还没有任何在跑的任务，所以这些必然是上次的残留。
+    #
+    # 刻意放在 __main__ 而不是 import 时：这是破坏性写入，挂在 import 上会让任何
+    # import 了发布记录模块的脚本（调试工具 / REPL / 维护命令）把**正在跑的任务**
+    # 误判成中断。
+    try:
+        cleaned = publish_records.init_on_startup()
+        if cleaned["orphans_interrupted"]:
+            print(f"🧹 已把 {cleaned['orphans_interrupted']} 条上次残留的发布记录标为「已中断」")
+        if cleaned["source_backfilled"]:
+            print(f"🧹 已为 {cleaned['source_backfilled']} 条老记录补上来源")
+    except Exception as exc:
+        print(f"⚠️ 启动收尾失败（不影响启动）: {exc}")
+
+    # 背景音乐的合成任务同样只活在内存里（见 sau_backend_music.py），重启后残留的
+    # 「合成中」会让那一列永远转圈、还会挡住重新合成。同样只在 __main__ 里清。
+    try:
+        stale = reset_bgm_stale_statuses()
+        if stale:
+            print(f"🧹 已把 {stale} 条被打断的「合成中」素材状态退回「待合成」")
+    except Exception as exc:
+        print(f"⚠️ 清理残留的合成状态失败（不影响启动）: {exc}")
+
+    # 账号会话定时续期：默认 0/7/14/20 点，对「账号管理」里的每个账号跑一次登录态校验，
+    # 顺带把服务端轮换下来的新票据写回 cookie 文件（见 myUtils/session_renew.py）。
+    # 放在这里而不是 import 时，是为了别让 import 本模块的脚本顺手开一个后台调度器；
+    # 自己的失败也不该拦着后端起来——最坏就是"这次没开、去界面上点一下开关"。
+    try:
+        session_renew.start()
+    except Exception as exc:
+        print(f"⚠️ 启动会话续期调度失败（不影响启动）: {exc}")
+
     app.run(host='0.0.0.0' ,port=5409)

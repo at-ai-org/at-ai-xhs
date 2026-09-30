@@ -73,6 +73,33 @@ cursor.execute('CREATE INDEX IF NOT EXISTS idx_publish_records_created ON publis
 cursor.execute('CREATE INDEX IF NOT EXISTS idx_publish_records_platform ON publish_records(platform, account_name)')
 cursor.execute('CREATE INDEX IF NOT EXISTS idx_publish_records_status ON publish_records(status)')
 
+# 背景音乐库（at-ai-xhs 改造新增）
+# 音乐文件本身放 bgmFile/，这张表只记元数据。合成后拼进素材文件名的是 name 字段。
+# 后端启动时（sau_backend.py 的 ensure_music_tables）也会建，老库不用重跑本脚本。
+cursor.execute('''CREATE TABLE IF NOT EXISTS background_music (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,               -- 展示名（不含扩展名）
+    file_name   TEXT NOT NULL,               -- bgmFile/ 下的磁盘文件名
+    filesize    REAL,                        -- MB
+    duration    REAL,                        -- 秒
+    upload_time DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
+# 素材的「背景音乐」状态（at-ai-xhs 改造新增）
+# 主键是素材磁盘文件名；素材改名（合成后必然改名）时同步改 key。
+# **没有行 = 待合成**，所以不用为每条素材预插一行。
+cursor.execute('''CREATE TABLE IF NOT EXISTS material_bgm (
+    file_path  TEXT PRIMARY KEY,
+    music_id   INTEGER,
+    music_name TEXT,
+    status     TEXT,                         -- running / done / failed
+    progress   INTEGER DEFAULT 0,
+    message    TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
 
 # 提交更改
 conn.commit()

@@ -34,9 +34,16 @@ from typing import Iterable, Sequence
 from patchright.async_api import Locator
 from patchright.async_api import Page
 
+from utils.humanize import human_type
+from utils.humanize import jitter_schedule
 from utils.log import xiaohongshu_logger
 
 from . import selectors as S
+
+# 防御性读取（conf.py 是本地文件，老副本缺新项时不该 ImportError），见 settings.py
+from .settings import XHS_HUMAN_TYPE_BUDGET
+from .settings import XHS_HUMAN_TYPE_DELAY
+from .settings import XHS_SCHEDULE_JITTER_MINUTES
 
 
 # --------------------------------------------------------------------------- #
@@ -474,7 +481,11 @@ class XhsPageOps:
         try:
             await loc.click()
             await self.page.keyboard.press(f"{self.modifier}+KeyA")
-            await loc.fill(truncated)
+            await self.page.keyboard.press("Delete")
+            # 逐字输入而不是 fill()：fill() 直接设 value，不产生逐键 keydown/keyup
+            await human_type(
+                self.page, truncated, delay=XHS_HUMAN_TYPE_DELAY, budget_s=XHS_HUMAN_TYPE_BUDGET
+            )
         except Exception as exc:
             return OpResult("fill_title", STATUS_FAILED, f"填写标题失败: {exc}")
 
@@ -509,7 +520,9 @@ class XhsPageOps:
             await loc.click()
             await self.page.keyboard.press(f"{self.modifier}+KeyA")
             await self.page.keyboard.press("Delete")
-            await self.page.keyboard.type(desc)
+            await human_type(
+                self.page, desc, delay=XHS_HUMAN_TYPE_DELAY, budget_s=XHS_HUMAN_TYPE_BUDGET
+            )
         except Exception as exc:
             return OpResult("fill_desc", STATUS_FAILED, f"填写正文失败: {exc}")
 
@@ -708,9 +721,19 @@ class XhsPageOps:
     # ------------------------------------------------------------------ #
 
     async def set_schedule(self, publish_at: datetime | None) -> OpResult:
-        """开启定时发布并填时间。平台限制：1 小时后 ~ 14 天内。"""
+        """开启定时发布并填时间。平台限制：1 小时后 ~ 14 天内。
+
+        会在填写前给时间加一个随机抖动（`conf.XHS_SCHEDULE_JITTER_MINUTES`）：
+        真人预约发布不会卡在 20:00:00 这种整点整分，机器会，抖动用于避开这个特征。
+        抖动**只往后推**，所以不会把时间推到过去；实际落库/落记录的是抖动后的时刻。
+        """
         if publish_at is None:
             return OpResult("set_schedule", STATUS_SKIPPED, "未指定定时时间，按立即发布处理")
+
+        # 先抖动，再按抖动后的时间做平台窗口校验——否则可能刚好卡在 14 天边界上被拒
+        publish_at, shift_minutes = jitter_schedule(
+            publish_at, XHS_SCHEDULE_JITTER_MINUTES
+        )
 
         # 平台窗口校验（早于 +1h 只能立即发；晚于 +14d 平台不接受）
         delta = publish_at - datetime.now()
@@ -749,11 +772,18 @@ class XhsPageOps:
         except Exception as exc:
             return OpResult("set_schedule", STATUS_FAILED, f"填写定时时间失败: {exc}")
 
+        if shift_minutes:
+            self._warn(
+                "🎲",
+                f"定时时间已随机后移 {shift_minutes} 分钟到 {value}（避开整点整分特征，"
+                f"可在 conf.XHS_SCHEDULE_JITTER_MINUTES 调整）",
+            )
+
         return OpResult(
             "set_schedule",
             STATUS_OK,
             f"已设置定时发布 {value}",
-            {"selector": switch_sel, "input": box_sel, "value": value},
+            {"selector": switch_sel, "input": box_sel, "value": value, "jitter_minutes": shift_minutes},
         )
 
     async def set_visibility(self, visibility: str | None) -> OpResult:

@@ -3,18 +3,24 @@
 
 检查项：
   1. 真实数据：按上传时间倒序、一页最多 20 条、AI 文案列「已有/无」、
+     「背景音乐」列（待合成/合成中/已合成，紧跟 AI 文案、UUID 列已去掉）、
      有文案→「预览文案」、无文案→「生成文案」、预览弹窗、搜索重置页码；
   2. 抓包替换成 45 条假素材，验证 20 条/页 的翻页行为；
   3. 上传：成功自动关窗 / 失败留在窗口里（上传接口用假响应，不会真传文件）；
   4. 加 --with-generate 时真点一次「生成文案」：会真调视觉模型、真写库，
      并且**会把那条素材改名成标题**（文件名只留中文和数字）——请挑一条不在乎名字的素材。
 
+本脚本只覆盖素材管理页；背景音乐页与「合成背景音乐」全链路在
+`tools/verify_bgm_page.py`（那个脚本自带隔离沙箱，不会碰真实数据）。
+
 前置：前端 Vite（5173）与后端 Flask（5409）都已启动（./start.sh），
       并且已在「模型设置」里配好模型——否则第 3 步必然失败。
+      登录密码读自 settings.json 的 auth.password，脚本会自己走一遍登录页。
 
 用法：
     .venv/bin/python tools/verify_material_page.py
     .venv/bin/python tools/verify_material_page.py --with-generate
+    .venv/bin/python tools/verify_material_page.py --base http://127.0.0.1:5175   # 换一个前端地址
 """
 
 import json
@@ -30,11 +36,64 @@ from conf import BASE_DIR  # noqa: F401,E402  # 导入它会把 PLAYWRIGHT_BROWS
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 BASE = "http://127.0.0.1:5173"
+if "--base" in sys.argv:
+    BASE = sys.argv[sys.argv.index("--base") + 1]
 URL = f"{BASE}/#/material-management"
 SHOT_DIR = Path("screenshots")
 SHOT_DIR.mkdir(exist_ok=True)
 
+VIEWPORT = {"width": 1440, "height": 950}
+
 failures: list[str] = []
+
+
+def read_credentials() -> tuple[str, str]:
+    """从 settings.json 读后台登录账号密码。
+
+    密码是首次启动后端时随机生成的（见 myUtils/web_auth.py）。
+    这里不写死、也不问用户，直接读那份文件——脚本本来就跑在同一个仓库里。
+    """
+    from myUtils.app_settings import SETTINGS_PATH  # 延迟导入：只在这里用到
+
+    if not Path(SETTINGS_PATH).is_file():
+        raise SystemExit(f"找不到 {SETTINGS_PATH}：先启动一次后端（./start.sh），它会生成随机密码")
+    cfg = json.loads(Path(SETTINGS_PATH).read_text(encoding="utf-8"))
+    auth = cfg.get("auth") or {}
+    password = (auth.get("password") or "").strip()
+    if not password:
+        raise SystemExit(f"{SETTINGS_PATH} 里没有 auth.password：启动一次后端会自动补上")
+    return (auth.get("username") or "admin").strip(), password
+
+
+def login_ui(browser):
+    """真走一遍登录页，返回可复用的 `storage_state`。
+
+    整个后台都要登录（前端路由守卫 + 后端 before_request 双重拦截）。
+    脚本若直接 goto 素材页，会被守卫赶到登录页，后面每条断言都会在
+    "找不到 .material-list" 上失败——所以必须先登录。
+
+    顺带就把登录页本身验了：填不上 / 点不动 / 跳不走，这里会直接超时报错。
+    """
+    username, password = read_credentials()
+    context = browser.new_context(viewport=VIEWPORT)
+    page = context.new_page()
+
+    page.goto(f"{BASE}/#/login", wait_until="networkidle")
+    page.fill('input[autocomplete="username"]', username)
+    page.fill('input[autocomplete="current-password"]', password)
+    page.click(".login-button")
+    # 登录成功后跳首页。hash 路由等 URL 不可靠，等登录后才有的侧边栏更稳。
+    page.wait_for_selector(".sidebar-menu", timeout=15000)
+
+    state = context.storage_state()  # 含 localStorage 里的 token
+    context.close()
+    return state
+
+
+def authed_page(browser, storage):
+    """开一个带着登录态的新页面（等价于原来的 browser.new_page(viewport=...)）。"""
+    context = browser.new_context(storage_state=storage, viewport=VIEWPORT)
+    return context.new_page()
 
 
 def check(cond, msg):
@@ -50,7 +109,11 @@ def rows_of(page):
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1440, "height": 950})
+        print("\n[0] 登录（账号 admin，密码读自 settings.json 的 auth.password）")
+        storage = login_ui(browser)
+        print("  ✅ 已登录，登录态将在下面的页面里复用")
+
+        page = authed_page(browser, storage)
         errors = []
         page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
         page.on("pageerror", lambda e: errors.append(str(e)))
@@ -65,12 +128,27 @@ def main():
         check(row_count <= 20, f"一页最多 20 条（当前 {row_count} 条）")
 
         # 上传时间倒序
-        times = page.locator(".material-list .el-table__row td:nth-child(4)").all_inner_texts()
+        # 列位置（2026-09-30 起，见下面的列头断言）：1 文件名 2 大小 3 上传时间 4 AI 文案
+        # 5 背景音乐 6 操作。所以时间在第 3 列、AI 文案在第 4 列——UUID 列已经去掉了。
+        times = page.locator(".material-list .el-table__row td:nth-child(3)").all_inner_texts()
         check(times == sorted(times, reverse=True), f"上传时间倒序：{times[:3]} …")
 
         # AI 文案列
-        tags = page.locator(".material-list .el-table__row td:nth-child(5)").all_inner_texts()
+        tags = page.locator(".material-list .el-table__row td:nth-child(4)").all_inner_texts()
         check(all(t.strip() in ("已有", "无") for t in tags), f"AI 文案列取值正常：{tags}")
+
+        # 列头：UUID 列已去掉，「背景音乐」列紧跟「AI 文案」
+        headers = [h.strip() for h in page.locator(".material-list .el-table__header th").all_inner_texts()]
+        check("UUID" not in headers, f"没有 UUID 列（当前列：{' / '.join(headers)}）")
+        check(
+            "背景音乐" in headers and headers.index("背景音乐") == headers.index("AI 文案") + 1,
+            "「背景音乐」列排在「AI 文案」之后",
+        )
+        bgm_tags = page.locator(".material-list .el-table__row td:nth-child(5)").all_inner_texts()
+        check(
+            all(t.strip() in ("待合成", "合成中", "已合成") for t in bgm_tags),
+            f"背景音乐列取值正常：{bgm_tags}",
+        )
 
         # 按钮：有文案 → 预览文案；无文案 → 生成文案
         gen = page.locator(".material-list button:has-text('生成文案')")
@@ -132,7 +210,7 @@ def main():
                 }
             )
 
-        page2 = browser.new_page(viewport={"width": 1440, "height": 950})
+        page2 = authed_page(browser, storage)
         page2.route(
             "**/getFiles*",
             lambda route: route.fulfill(
@@ -224,7 +302,7 @@ def main():
             page.screenshot(path=str(SHOT_DIR / "material_generate_result.png"))
             page.keyboard.press("Escape")
             page.wait_for_timeout(900)
-            after = page.locator(".material-list .el-table__row td:nth-child(5)").all_inner_texts()
+            after = page.locator(".material-list .el-table__row td:nth-child(4)").all_inner_texts()
             check("已有" in after, "生成后该行 AI 文案列变为「已有」")
             new_name = page.locator(".material-list .el-table__row td:nth-child(2)").first.inner_text().strip()
             check(

@@ -41,6 +41,17 @@ export const publishApi = {
     return http.post('/publish/submit', payload)
   },
 
+  /**
+   * 重复发布检查：这批「素材 × 平台 × 账号」里，哪些此前已经发过了？
+   *
+   * 同一个账号再发一次同一条素材，平台上就会出现两条重复内容。所以点「开始发布」
+   * 之前先问一次，有重复就把明细列出来让人确认。
+   * 返回 { conflicts[], total, published, in_flight, task_count }。
+   */
+  checkPublished(payload) {
+    return http.post('/publish/check-published', payload)
+  },
+
   /** 批次实时进度（含平台 / 账号 / 任务三层和每个任务的最新动作） */
   getJob(jobId) {
     return http.get(`/publish/job/${jobId}`)
@@ -56,9 +67,22 @@ export const publishApi = {
     return http.get('/publish/jobs', params)
   },
 
-  /** 取消批次里还没开始的任务（正在跑的那个不受影响） */
-  cancelJob(jobId) {
-    return http.post(`/publish/job/${jobId}/cancel`, {})
+  /**
+   * 中断**单个**任务：排队中的、正在跑的都能中断。
+   *
+   * 后端会立刻给结论（不会等那个可能卡死的线程收尾），所以刷新进度就能看到「已取消」。
+   */
+  cancelTask(taskId) {
+    return http.post(`/publish/task/${taskId}/cancel`, {})
+  },
+
+  /**
+   * 取消批次里的任务。
+   * 默认只取消**还没开始**的；传 { running: true } 连正在跑的一起中断
+   * （中断一个发到一半的任务有代价，所以得用户明确要）。
+   */
+  cancelJob(jobId, { running = false } = {}) {
+    return http.post(`/publish/job/${jobId}/cancel`, { running })
   },
 
   /**

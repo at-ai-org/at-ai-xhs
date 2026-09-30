@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import { clearSession, getToken } from '@/utils/session'
 
 // 创建axios实例
 const request = axios.create({
@@ -12,8 +13,10 @@ const request = axios.create({
 // 请求拦截器
 request.interceptors.request.use(
   (config) => {
-    // 可以在这里添加token等认证信息
-    const token = localStorage.getItem('token')
+    // 带上下载态的 token。后端在 myUtils/web_auth.py 的 token_from() 里读
+    // `Authorization: Bearer xxx`；SSE 那种没法设请求头的接口改用查询串
+    // （见 utils/session.js 的 withToken）。
+    const token = getToken()
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
     }
@@ -24,6 +27,31 @@ request.interceptors.request.use(
     return Promise.reject(error)
   }
 )
+
+// 登录接口自己会返回 401（密码错），不能拿它去触发"登录过期"那一套，
+// 否则用户在登录页输错密码会被立刻"重定向到登录页"，提示也看不清。
+function isLoginRequest(config) {
+  return (config?.url || '').includes('/auth/login')
+}
+
+// 多个请求同时失效时（页面一加载会并发好几个），只提示一次、只跳一次
+let redirecting = false
+
+function handleSessionExpired() {
+  clearSession()
+  if (redirecting) return
+  redirecting = true
+  ElMessage.warning('登录已过期，请重新登录')
+  // 这里刻意不 import router：router → views → api → request 会绕成循环依赖，
+  // 而改 hash 本来就等价于走一次路由。
+  if (!window.location.hash.startsWith('#/login')) {
+    window.location.hash = '#/login'
+  }
+  // 留一点时间让当前这轮并发请求的提示都散掉，再允许下一次提示
+  setTimeout(() => {
+    redirecting = false
+  }, 1000)
+}
 
 // 响应拦截器
 request.interceptors.response.use(
@@ -44,6 +72,17 @@ request.interceptors.response.use(
     // 处理HTTP错误状态码
     if (error.response) {
       const { status, data } = error.response
+
+      // 401：token 缺失 / 过期 / 被改过（例如 settings.json 换了 secret_key）。
+      // 统一在这里收口——清掉本地登录态并回登录页，业务代码不用各自处理。
+      if (status === 401 && !isLoginRequest(error.config)) {
+        const serverMsg = data && typeof data === 'object' ? data.msg : ''
+        // 已经跳过一次就不再重复弹（并发请求会一起 401）
+        if (!redirecting) handleSessionExpired()
+        else if (serverMsg) console.warn('401:', serverMsg)
+        return Promise.reject(error)
+      }
+
       // 后端出错时自己会带 msg（例如"视频文件不存在: xxx"、"还没有配置模型服务地址"），
       // 比"服务器内部错误"这种笼统提示有用得多，优先透出。
       // 注意：Flask 自己产生的错误页（如 413 的 HTML）不是 JSON，取不到 msg，走下面的兜底。
@@ -55,13 +94,15 @@ request.interceptors.response.use(
       switch (status) {
         case 401:
           ElMessage.error('未授权，请重新登录')
-          // 可以在这里处理登录跳转
           break
         case 403:
           ElMessage.error('拒绝访问')
           break
         case 404:
           ElMessage.error('请求地址不存在')
+          break
+        case 429:
+          ElMessage.error('操作太频繁，请稍后再试')
           break
         case 500:
           ElMessage.error('服务器内部错误')

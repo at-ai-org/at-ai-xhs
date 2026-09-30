@@ -1,5 +1,9 @@
 <template>
-  <div class="model-settings">
+  <div class="settings-page">
+    <div class="page-header">
+      <h1>设置</h1>
+    </div>
+
     <el-card shadow="never" class="mb16">
       <template #header>
         <div class="card-header">
@@ -37,7 +41,7 @@
             :placeholder="form.has_key ? `已保存（${form.api_key_masked}），留空表示不修改` : 'sk-...'"
             style="max-width: 520px"
           />
-          <div class="hint">明文保存在本机 model_settings.json（权限 600），接口只回传掩码</div>
+          <div class="hint">明文保存在本机 settings.json（权限 600），接口只回传掩码</div>
         </el-form-item>
 
         <el-form-item label="模型名">
@@ -76,6 +80,16 @@
       </el-form>
     </el-card>
 
+    <!--
+      账号会话续期：功能本体在后端（myUtils/session_renew.py），这里只是把开关和
+      时间点也放到设置里。开关组件与「账号管理」页那个按钮是同一份状态，
+      所以两边点哪个都一样。
+    -->
+    <el-card shadow="never" class="mb16">
+      <template #header><span>账号会话续期</span></template>
+      <SessionRenewToggle show-times />
+    </el-card>
+
     <el-card shadow="never">
       <template #header><span>发布默认值</span></template>
       <el-form label-width="130px">
@@ -112,6 +126,11 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { xhsApi } from '@/api/xhs'
+// 「定时续期」开关 + 时间点编辑（后端调度见 myUtils/session_renew.py）。
+// 这是页面里**唯一**一个自带保存的组件：点开关立刻生效、改时间点要按它自己的「保存时间点」。
+// 所以 payload() 里刻意不带 session_renew——主「保存」按钮只负责模型和发布默认值，
+// 免得两个按钮抢着写同一个字段。
+import SessionRenewToggle from '@/components/SessionRenewToggle.vue'
 
 const form = reactive({
   base_url: '',
@@ -154,6 +173,8 @@ async function load() {
 }
 
 function payload() {
+  // 注意：**不带 session_renew**。续期开关/时间点由上面的 SessionRenewToggle 自己保存
+  // （它在两页上都出现，点了要立刻生效），这里再带一份就会互相覆盖。
   const p = {
     default_collection: defaultCollection.value,
     tencent_content_label: tencentContentLabel.value,
@@ -206,8 +227,16 @@ onMounted(load)
 </script>
 
 <style scoped>
-.model-settings {
+.settings-page {
   max-width: 900px;
+}
+.page-header {
+  margin-bottom: 20px;
+}
+.page-header h1 {
+  font-size: 24px;
+  color: var(--el-text-color-primary);
+  margin: 0;
 }
 .mb16 {
   margin-bottom: 16px;

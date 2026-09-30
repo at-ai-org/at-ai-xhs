@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="自媒体自动化运营系统">
+  <title>自媒体自动化运营系统</title>
+
+  <defs>
+    <!-- 品牌色：与登录页背景（#001529 → #0b5ea8）、Element Plus 主色 #409EFF 同一族 -->
+    <linearGradient id="sau-badge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#59AEFF"/>
+      <stop offset="1" stop-color="#1257C8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 徽章底：圆角方块，四角半径 23%（接近 squircle），小尺寸下轮廓仍然清楚 -->
+  <rect width="64" height="64" rx="15" fill="url(#sau-badge)"/>
+
+  <!--
+    主体：播放键（视频）。
+    用「细三角形 + 同色描边 round」得到圆角三角形——比手写贝塞尔圆角更好维护，
+    而且圆角比例随缩放一起走，16px 下不会糊成一团。
+  -->
+  <path d="M23.5 20 L23.5 44 L44 32 Z"
+        fill="#fff" stroke="#fff" stroke-width="5.5" stroke-linejoin="round"/>
+
+  <!--
+    点缀：四角星（AI / 自动化）。
+    刻意与播放键留出空隙：16px 时它退化成一个小亮点，但不会和主体黏成一坨。
+  -->
+  <path d="M49 8.5 C50.8 14 50.8 14 56 15.8 C50.8 17.6 50.8 17.6 49 23 C47.2 17.6 47.2 17.6 42 15.8 C47.2 14 47.2 14 49 8.5 Z"
+        fill="#FFC93C"/>
+</svg>

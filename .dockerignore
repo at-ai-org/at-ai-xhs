@@ -16,7 +16,7 @@ env
 
 # 【敏感】配置与凭据：镜像里由 conf.example.py 复制生成 conf.py
 conf.py
-model_settings.json
+settings.json
 accounts.ini
 cookies
 cookiesFile
@@ -34,6 +34,8 @@ videos
 # 本地素材（Dockerfile 内会自行 mkdir）
 videoFile
 uploadFile
+# 背景音乐库（同上，运行目录由 Dockerfile / docker-entrypoint.sh 建）
+bgmFile
 
 # 数据库
 db/*.db
@@ -58,4 +60,3 @@ sau_frontend/package-lock.json
 # 文档与测试（运行时不依赖）
 docs
 tests
-README.upstream.md

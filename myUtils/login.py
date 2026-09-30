@@ -319,6 +319,64 @@ def get_browser_options():
 
     return options
 
+
+def _record_account(platform_type: int, cookie_file: str, user_name: str) -> tuple[int, bool]:
+    """记录一次成功的扫码登录，返回 `(account_id, 是否新建)`。
+
+    必须是**幂等**的：同一个「平台 + 账号名」只应存在一行。
+
+    这里原来是四个平台各自一句裸 `INSERT`，于是「重新扫码」会插出一条全新记录，
+    旧的那条留在库里继续报「异常」——界面上就出现两个同名账号，而且旧记录还占着
+    历史发布记录的引用（本次就是这样冒出来的 bug）。
+
+    去重时**保留 id 最小的那条**（原先就存在的那条），只把 `filePath` 指向新 cookie、
+    `status` 置为正常。不能反过来"删旧留新"：`publish_records.account_id` 引用着
+    `user_info.id`，删掉旧 id 会让历史发布记录被判定成"账号不存在（可能已被删除）"
+    （见 `sau_backend_publish.py` 的账号校验）。万一重复行本身也被历史记录引用着，
+    这些引用会先被改指到保留的那条，避免历史断链。
+    """
+    db_path = Path(BASE_DIR) / "db" / "database.db"
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        existing = [
+            int(row[0])
+            for row in cursor.execute(
+                "SELECT id FROM user_info WHERE type = ? AND userName = ? ORDER BY id",
+                (platform_type, user_name),
+            ).fetchall()
+        ]
+
+        if not existing:
+            cursor.execute(
+                "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)",
+                (platform_type, cookie_file, user_name, 1),
+            )
+            conn.commit()
+            return int(cursor.lastrowid), True
+
+        keep, duplicates = existing[0], existing[1:]
+        cursor.execute(
+            "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+            (cookie_file, keep),
+        )
+        for dup in duplicates:
+            # 重复行的历史引用先改指到保留行，再删——顺序反了会断链
+            try:
+                cursor.execute(
+                    "UPDATE publish_records SET account_id = ? WHERE account_id = ?",
+                    (keep, dup),
+                )
+            except sqlite3.OperationalError:
+                # 老库可能还没有 publish_records 表；没有历史记录自然也不用改指
+                pass
+            cursor.execute("DELETE FROM user_info WHERE id = ?", (dup,))
+        conn.commit()
+
+        if duplicates:
+            print(f"♻️ 合并重复账号记录（{user_name}）：保留 id={keep}，清掉 {duplicates}")
+
+    return keep, False
+
 # 抖音登录
 async def douyin_cookie_gen(id, status_queue):
     """抖音登录：**直接复用上游主线的 uploader 实现**，不再自己写。
@@ -376,86 +434,105 @@ async def douyin_cookie_gen(id, status_queue):
         return None
 
     print(f"✅ 抖音登录成功: {result.get('message')} → {account_file.name}")
-    with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, ?)",
-            (3, account_file.name, id, 1),
-        )
-        conn.commit()
-        print("✅ 用户状态已记录")
+    _record_account(3, account_file.name, id)
+    print("✅ 用户状态已记录")
     status_queue.put("200")
     return None
 
 
 # 视频号登录
-async def get_tencent_cookie(id,status_queue):
+async def get_tencent_cookie(id, status_queue):
+    """视频号扫码登录（Web「账号管理」入口）。
 
-    async with async_playwright() as playwright:
-        options = {
-            'args': [
-                '--lang en-GB'
-            ],
-            'headless': LOCAL_CHROME_HEADLESS,  # Set headless option here
-        }
-        # Make sure to run headed.
-        browser = await playwright.chromium.launch(**options)
-        # Setup context however you like.
-        context = await browser.new_context()  # Pass any options
-        # Pause the page, and start recording manually.
-        context = await set_init_script(context)
-        page = await context.new_page()
-        await page.goto("https://channels.weixin.qq.com")
-        original_url = page.url
+    和 uploader 那条登录路径共用 `uploader/tencent_uploader/session.py`：
 
+    * 登录在**临时 profile** 里进行，成功后归位到 `cookies/tencent_uploader/uin_<微信号>/`，
+      以后校验和发布都用它——**扫码时和发布时是同一台「设备」**，这是以前缺的一环
+      （以前每次任务都是 `new_context(storage_state=…)`，等于每次都是一台新设备）；
+    * 二维码提取 / 等登录逻辑原样保留（那段是踩坑调出来的，别动）；
+    * 任何异常都会给前端推一个 500，不再出现「弹窗一直转圈、日志里什么都没有」。
+    """
+    from patchright.async_api import async_playwright as _async_playwright
 
-        # 二维码在 open.weixin.qq.com 的 iframe 里。
-        # 用 CSS 选择器定位，不能用 get_by_role("img")——实测匹配数为 0（alt 为空）。
-        iframe_locator = page.frame_locator("iframe").first
-        src = await _grab_img_src(iframe_locator, timeout=60)
-        if not src:
-            raise RuntimeError("60 秒内没有拿到视频号二维码（页面可能改版或未加载出来）")
-        _frame = next((f for f in page.frames if "open.weixin.qq.com" in f.url), None)
-        src = await _normalize_qr(context, src, _frame.url if _frame else page.url)
-        _verify_qr_decodable(src, id)
-        print("✅ 二维码已就绪:", (src or "")[:60])
-        status_queue.put(src)
+    from uploader.tencent_uploader.session import (
+        discard_profile,
+        finalize_login_profile,
+        save_storage_state,
+        tencent_session,
+    )
 
-        if not (await _wait_login(context, page, original_url, timeout=120, label=id))[0]:
+    cookies_dir = Path(BASE_DIR / "cookiesFile")
+    cookies_dir.mkdir(exist_ok=True)
+    uuid_v1 = uuid.uuid1()
+    account_file = cookies_dir / f"{uuid_v1}.json"
+    staging: Path | None = None
+    verified = False
+
+    try:
+        async with _async_playwright() as playwright:
+            # seed=False → 一个全新的临时 profile（登录成功后再归位）；
+            # persist=False → 登录途中不写账号文件，确认成功才由下面显式回写。
+            async with tencent_session(playwright, None, seed=False, persist=False) as session:
+                staging = Path(session.profile_dir)
+                context = session.context
+                page = await context.new_page()
+                await page.goto("https://channels.weixin.qq.com")
+                original_url = page.url
+
+                # 二维码在 open.weixin.qq.com 的 iframe 里。
+                # 用 CSS 选择器定位，不能用 get_by_role("img")——实测匹配数为 0（alt 为空）。
+                iframe_locator = page.frame_locator("iframe").first
+                src = await _grab_img_src(iframe_locator, timeout=60)
+                if not src:
+                    raise RuntimeError("60 秒内没有拿到视频号二维码（页面可能改版或未加载出来）")
+                _frame = next((f for f in page.frames if "open.weixin.qq.com" in f.url), None)
+                src = await _normalize_qr(context, src, _frame.url if _frame else page.url)
+                _verify_qr_decodable(src, id)
+                print("✅ 二维码已就绪:", (src or "")[:60])
+                status_queue.put(src)
+
+                if not (await _wait_login(context, page, original_url, timeout=120, label=id))[0]:
+                    hint = _manual_login_hint(2, 120)
+                    print(f"💡 {hint}")
+                    status_queue.put(f"msg:{hint}")
+                    status_queue.put("500")
+                    return None
+
+                print(f"UUID v1: {uuid_v1}")
+                if not await save_storage_state(context, account_file):
+                    status_queue.put("500")
+                    return None
+
+        # 浏览器已关：先让 profile 归位，再校验。
+        # 校验要再开一次浏览器，而同一个 profile 目录同时只能有一个 Chrome。
+        placement = finalize_login_profile(account_file, staging)
+        if not await check_cookie(2, account_file.name):
+            status_queue.put("500")
+            account_file.unlink(missing_ok=True)
+            if placement.created:
+                # 这次登录新建的 profile 目录：既然校验没过，别留着冒充"这个号的设备"
+                discard_profile(placement.path)
+            return None
+        verified = True
+
+        _record_account(2, f"{uuid_v1}.json", id)
+        print("✅ 用户状态已记录")
+        status_queue.put("200")
+        return None
+    except Exception as exc:
+        print(f"❌ 视频号登录异常: {exc}")
+        if not verified:
+            # 半成品一样都不留：账号文件 + 临时 profile
+            try:
+                account_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            discard_profile(staging)
             hint = _manual_login_hint(2, 120)
             print(f"💡 {hint}")
             status_queue.put(f"msg:{hint}")
             status_queue.put("500")
-            await page.close()
-            await context.close()
-            await browser.close()
-            return None
-        uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
-        # 确保cookiesFile目录存在
-        cookies_dir = Path(BASE_DIR / "cookiesFile")
-        cookies_dir.mkdir(exist_ok=True)
-        await context.storage_state(path=cookies_dir / f"{uuid_v1}.json")
-        result = await check_cookie(2,f"{uuid_v1}.json")
-        if not result:
-            status_queue.put("500")
-            await page.close()
-            await context.close()
-            await browser.close()
-            return None
-        await page.close()
-        await context.close()
-        await browser.close()
-
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                                INSERT INTO user_info (type, filePath, userName, status)
-                                VALUES (?, ?, ?, ?)
-                                ''', (2, f"{uuid_v1}.json", id, 1))
-            conn.commit()
-            print("✅ 用户状态已记录")
-        status_queue.put("200")
+        return None
 
 # 快手登录
 async def get_ks_cookie(id,status_queue):
@@ -517,14 +594,8 @@ async def get_ks_cookie(id,status_queue):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                                        INSERT INTO user_info (type, filePath, userName, status)
-                                        VALUES (?, ?, ?, ?)
-                                        ''', (4, f"{uuid_v1}.json", id, 1))
-            conn.commit()
-            print("✅ 用户状态已记录")
+        _record_account(4, f"{uuid_v1}.json", id)
+        print("✅ 用户状态已记录")
         status_queue.put("200")
 
 # 小红书登录
@@ -585,14 +656,8 @@ async def xiaohongshu_cookie_gen(id,status_queue):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                           INSERT INTO user_info (type, filePath, userName, status)
-                           VALUES (?, ?, ?, ?)
-                           ''', (1, f"{uuid_v1}.json", id, 1))
-            conn.commit()
-            print("✅ 用户状态已记录")
+        _record_account(1, f"{uuid_v1}.json", id)
+        print("✅ 用户状态已记录")
         status_queue.put("200")
 
 # a = asyncio.run(xiaohongshu_cookie_gen(4,None))

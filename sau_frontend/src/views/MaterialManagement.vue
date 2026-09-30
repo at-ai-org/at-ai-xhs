@@ -25,7 +25,6 @@
       
       <div class="material-list">
         <el-table :data="pagedMaterials" style="width: 100%">
-          <el-table-column prop="uuid" label="UUID" width="180" show-overflow-tooltip />
           <el-table-column prop="filename" label="文件名" min-width="240" show-overflow-tooltip />
           <el-table-column prop="filesize" label="文件大小" width="110">
             <template #default="scope">
@@ -40,7 +39,19 @@
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="300" fixed="right">
+          <!-- 背景音乐状态列：紧跟 AI 文案（需求指定），三档文案见 bgmText() -->
+          <el-table-column label="背景音乐" width="110" align="center">
+            <template #default="scope">
+              <el-tooltip :disabled="!bgmTooltip(scope.row)" :content="bgmTooltip(scope.row)" placement="top">
+                <el-tag size="small" :type="bgmTagType(scope.row)" effect="plain">
+                  {{ bgmText(scope.row) }}
+                </el-tag>
+              </el-tooltip>
+            </template>
+          </el-table-column>
+          <!-- 操作列**不固定**：四个按钮并排约需 340px，380 留一点余量就够，
+               固定住反而挡住文件名，宽度给太多则会在右侧留一段空白 -->
+          <el-table-column label="操作" width="380">
             <template #default="scope">
               <el-button size="small" @click="handlePreview(scope.row)">预览</el-button>
               <el-button
@@ -61,6 +72,16 @@
                 @click="handleGenerateCopy(scope.row)"
               >
                 生成文案
+              </el-button>
+              <!-- 只有视频能换音轨，图片素材上不显示这个按钮 -->
+              <el-button
+                v-if="isVideoFile(scope.row)"
+                size="small"
+                type="warning"
+                plain
+                @click="openBgmDialog(scope.row)"
+              >
+                背景音乐
               </el-button>
               <el-button size="small" type="danger" @click="handleDelete(scope.row)">删除</el-button>
             </template>
@@ -201,6 +222,83 @@
       </div>
     </el-dialog>
 
+    <!-- 合成背景音乐对话框 -->
+    <el-dialog
+      v-model="bgmDialogVisible"
+      title="合成背景音乐"
+      width="560px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="!isComposing"
+      @closed="onBgmDialogClosed"
+    >
+      <div v-if="bgmMaterial" class="bgm-compose">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="合成会去掉原视频的音轨，换成选中的背景音乐"
+          description="音乐比视频短会自动循环播放；成品文件名变成「原名-音乐名.mp4」，原文件被替换掉。"
+        />
+
+        <div class="bgm-material">
+          素材：<strong>{{ bgmMaterial.filename }}</strong>
+        </div>
+
+        <div class="bgm-picker">
+          <el-select
+            v-model="bgmMusicId"
+            placeholder="选择背景音乐"
+            filterable
+            clearable
+            :loading="isLoadingMusic"
+            :disabled="isComposing"
+            class="bgm-select"
+          >
+            <el-option v-for="item in musicList" :key="item.id" :label="item.name" :value="item.id">
+              <span>{{ item.name }}</span>
+              <span class="bgm-option-meta">{{ formatDuration(item.duration) }}</span>
+            </el-option>
+          </el-select>
+          <el-button :disabled="!bgmMusicId" @click="toggleMusicPreview">
+            {{ previewingMusicId === bgmMusicId ? '停止' : '试听' }}
+          </el-button>
+        </div>
+
+        <div v-if="!isLoadingMusic && !musicList.length" class="bgm-hint">
+          还没有背景音乐，先去
+          <el-link type="primary" :underline="false" @click="goMusicPage">背景音乐</el-link>
+          页上传。
+        </div>
+
+        <!-- 试听共用一个 audio（和背景音乐页同一个做法） -->
+        <audio ref="bgmAudioRef" preload="none" style="display: none" @ended="stopMusicPreview" @error="stopMusicPreview" />
+
+        <!-- 合成进度：任务一提交就显示，百分比来自后端（ffmpeg 的真实写入位置） -->
+        <div v-if="composeTask" class="bgm-progress">
+          <el-progress
+            :percentage="composePercent"
+            :status="composeProgressStatus"
+            :stroke-width="16"
+            :text-inside="true"
+          />
+          <div class="bgm-progress-text">
+            <span>{{ composeTask.message || '正在合成…' }}</span>
+            <span v-if="composeTask.output">→ {{ composeTask.output }}</span>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button :disabled="isComposing" @click="bgmDialogVisible = false">关闭</el-button>
+          <el-button v-if="isComposing" type="danger" plain @click="cancelCompose">中断合成</el-button>
+          <el-button v-else type="primary" :disabled="!bgmMusicId" @click="startCompose">
+            开始合成
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
+
     <!-- AI 文案预览对话框 -->
     <el-dialog
       v-model="copyDialogVisible"
@@ -256,15 +354,18 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { Refresh, Upload } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 import { materialApi } from '@/api/material'
+import { musicApi } from '@/api/music'
 import { xhsApi } from '@/api/xhs'
 import { useAppStore } from '@/stores/app'
 
 // 获取应用状态管理
 const appStore = useAppStore()
+const router = useRouter()
 
 // 搜索和状态控制
 const searchKeyword = ref('')
@@ -312,6 +413,8 @@ const fetchMaterials = async (silent = false) => {
     if (response.code === 200) {
       appStore.setMaterials(response.data)
       if (!silent) ElMessage.success('刷新成功')
+      // 拉完就知道有没有素材在合成中：有就开轮询，没有就停掉
+      ensureStatusPolling()
     }
   } catch (error) {
     // 失败提示由请求拦截器统一弹出（会带后端的具体原因）
@@ -447,9 +550,282 @@ const handleGenerateCopy = async (material, options = {}) => {
   }
 }
 
+// --------------------------------------------------------------------------- //
+// 背景音乐合成（选音乐 → 后台 ffmpeg 换掉原音轨 → 原地替换素材）
+//
+// 合成是异步的：`POST /music/compose` 只回任务号，进度靠轮询 `/music/task/<id>`
+// （百分比是 ffmpeg 的真实写入位置，不是估算）。完成后素材会被改名成
+// 「原名-音乐名.mp4」，所以必须整表重拉一次，不能只改这一行。
+// --------------------------------------------------------------------------- //
+
+const bgmDialogVisible = ref(false)
+const bgmMaterial = ref(null)
+const bgmMusicId = ref(null)
+const musicList = ref([])
+const isLoadingMusic = ref(false)
+const isComposing = ref(false)
+const composeTask = ref(null)
+const previewingMusicId = ref(null)
+const bgmAudioRef = ref(null)
+
+// 弹窗里那个任务的轮询、以及列表「背景音乐」列的轮询
+let composeTimer = null
+let statusTimer = null
+
+const composePercent = computed(() => {
+  const task = composeTask.value
+  if (!task) return 0
+  if (task.state === 'done') return 100
+  // 没结束前不显示 100%：完成是后端说的，不是进度条凑到的
+  return Math.max(0, Math.min(99, Number(task.progress) || 0))
+})
+
+const composeProgressStatus = computed(() => {
+  const state = composeTask.value?.state
+  if (state === 'done') return 'success'
+  if (state === 'failed' || state === 'cancelled') return 'exception'
+  return undefined
+})
+
+const formatDuration = (seconds) => {
+  const total = Math.round(Number(seconds) || 0)
+  if (!total) return '—'
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
+}
+
+// ---- 状态列的显示 ----------------------------------------------------------
+
+const bgmText = (row) => row?.bgm_status_text || '待合成'
+
+const bgmTagType = (row) => {
+  const map = { done: 'success', running: 'warning', failed: 'danger' }
+  return map[row?.bgm_status] || 'info'
+}
+
+/** 悬停提示：合成中给百分比、已合成给音乐名、失败给原因（失败时列里显示的仍是「待合成」）。*/
+const bgmTooltip = (row) => {
+  const status = row?.bgm_status
+  if (status === 'running') {
+    return `正在合成${row.bgm_music ? `：${row.bgm_music}` : ''}（${row.bgm_progress || 0}%）`
+  }
+  if (status === 'done') {
+    return row.bgm_music ? `已用「${row.bgm_music}」替换原音轨` : '已合成'
+  }
+  return row?.bgm_message || ''
+}
+
+/** 就地改某一行的合成状态（列表对象就是 store 里的对象，改完表格立刻刷新）。*/
+const applyBgmToRow = (disk, patch) => {
+  const row = appStore.materials.find((m) => diskNameOf(m) === disk)
+  if (!row) return
+  if (patch.status) row.bgm_status = patch.status
+  if (patch.text) row.bgm_status_text = patch.text
+  row.bgm_progress = Number(patch.progress) || 0
+  if (patch.message !== undefined) row.bgm_message = patch.message || ''
+}
+
+// ---- 列表那一列的轮询（刷新页面后仍能看到别人的合成进度） -------------------
+
+/** 只在"确实有素材在合成中"时才开轮询，空闲时一次多余请求都不发。*/
+function ensureStatusPolling() {
+  const anyRunning = appStore.materials.some((m) => m.bgm_status === 'running')
+  if (anyRunning && !statusTimer) {
+    statusTimer = setInterval(refreshBgmStatuses, 3000)
+  } else if (!anyRunning && statusTimer) {
+    clearInterval(statusTimer)
+    statusTimer = null
+  }
+}
+
+async function refreshBgmStatuses() {
+  try {
+    const res = await musicApi.statuses()
+    const map = res.data || {}
+    let renamed = false
+    for (const material of appStore.materials) {
+      const disk = diskNameOf(material)
+      const status = map[disk]
+      if (status) {
+        material.bgm_status = status.status
+        material.bgm_status_text = status.status_text
+        material.bgm_music = status.music_name
+        material.bgm_progress = status.progress
+        material.bgm_message = status.message
+        continue
+      }
+      // 记录没了、而这行本来在合成中 → 合成成功后素材改名了，整表重拉
+      if (material.bgm_status === 'running') renamed = true
+    }
+    if (renamed) await fetchMaterials(true)
+  } catch (error) {
+    /* 网络抖动/后端重启：下一轮再试，不打扰用户 */
+  } finally {
+    ensureStatusPolling()
+  }
+}
+
+// ---- 弹窗 ------------------------------------------------------------------
+
+const fetchMusicList = async () => {
+  isLoadingMusic.value = true
+  try {
+    const res = await musicApi.list()
+    if (res.code === 200) {
+      musicList.value = res.data || []
+      // 只有一首就默认选上，省一次点击
+      if (musicList.value.length === 1) bgmMusicId.value = musicList.value[0].id
+    }
+  } catch (error) {
+    /* 拦截器已提示 */
+  } finally {
+    isLoadingMusic.value = false
+  }
+}
+
+const openBgmDialog = async (material) => {
+  bgmMaterial.value = material
+  bgmMusicId.value = null
+  composeTask.value = null
+  bgmDialogVisible.value = true
+  stopMusicPreview()
+  await fetchMusicList()
+}
+
+const onBgmDialogClosed = () => {
+  stopMusicPreview()
+  composeTask.value = null
+  bgmMaterial.value = null
+}
+
+const stopMusicPreview = () => {
+  const el = bgmAudioRef.value
+  if (el) {
+    el.pause()
+    el.removeAttribute('src')
+    el.load()
+  }
+  previewingMusicId.value = null
+}
+
+const toggleMusicPreview = () => {
+  if (!bgmMusicId.value) return
+  if (previewingMusicId.value === bgmMusicId.value) {
+    stopMusicPreview()
+    return
+  }
+  const el = bgmAudioRef.value
+  if (!el) return
+  stopMusicPreview()
+  el.src = musicApi.fileUrl(bgmMusicId.value)
+  previewingMusicId.value = bgmMusicId.value
+  const played = el.play()
+  if (played && typeof played.catch === 'function') {
+    played.catch(() => {
+      previewingMusicId.value = null
+      ElMessage.warning('浏览器没能开始播放，请再点一次「试听」')
+    })
+  }
+}
+
+const goMusicPage = () => {
+  bgmDialogVisible.value = false
+  router.push('/background-music')
+}
+
+const startCompose = async () => {
+  const material = bgmMaterial.value
+  const musicId = bgmMusicId.value
+  if (!material || !musicId || isComposing.value) return
+
+  const disk = diskNameOf(material)
+  if (!disk) {
+    ElMessage.error('这条素材没有文件名，无法合成背景音乐')
+    return
+  }
+
+  stopMusicPreview()
+  isComposing.value = true
+  composeTask.value = { state: 'queued', progress: 0, message: '正在提交合成任务…', material: disk }
+  applyBgmToRow(disk, { status: 'running', text: '合成中', progress: 0, message: '' })
+
+  try {
+    const res = await musicApi.compose(disk, musicId)
+    const taskId = res.data?.task_id
+    if (!taskId) throw new Error('后端没有返回任务号')
+    startComposePolling(taskId)
+  } catch (error) {
+    // 具体原因（素材不存在、没有视频轨、正在合成中…）由请求拦截器提示
+    isComposing.value = false
+    composeTask.value = null
+    await fetchMaterials(true)
+  }
+}
+
+function startComposePolling(taskId) {
+  stopComposePolling()
+  composeTimer = setInterval(async () => {
+    let task = null
+    try {
+      const res = await musicApi.getTask(taskId)
+      task = res.data || {}
+    } catch (error) {
+      // 任务查不到（后端重启 / 被清理）：停下轮询，别每 800ms 弹一次错
+      stopComposePolling()
+      isComposing.value = false
+      ElMessage.warning('查不到合成进度了（后端可能重启过），请刷新列表确认结果')
+      return
+    }
+
+    composeTask.value = task
+    if (task.state === 'queued' || task.state === 'running') {
+      applyBgmToRow(task.material, {
+        status: 'running',
+        text: '合成中',
+        progress: task.progress,
+        message: ''
+      })
+      return
+    }
+
+    stopComposePolling()
+    await finishCompose(task)
+  }, 800)
+}
+
+function stopComposePolling() {
+  if (composeTimer) {
+    clearInterval(composeTimer)
+    composeTimer = null
+  }
+}
+
+async function finishCompose(task) {
+  isComposing.value = false
+  await fetchMaterials(true)
+
+  if (task.state === 'done') {
+    ElMessage.success(`合成完成：${task.output || ''}`)
+    // 素材已经改名，弹窗里拿的还是旧引用，关掉免得再点一次「开始合成」报"文件不存在"
+    bgmDialogVisible.value = false
+  } else if (task.state === 'cancelled') {
+    ElMessage.info('已中断合成')
+  } else {
+    ElMessage.error(task.message || '合成失败')
+  }
+}
+
+const cancelCompose = async () => {
+  const taskId = composeTask.value?.task_id
+  if (!taskId) return
+  try {
+    await musicApi.cancelTask(taskId)
+  } catch (error) {
+    /* 任务已经结束：让它自然收敛，不用额外提示 */
+  }
+}
+
 // 上传素材
-const handleUploadMaterial = () => {
-  // 清空变量
+const handleUploadMaterial = () => {  // 清空变量
   fileList.value = []
   customFilename.value = ''
   uploadProgress.value = {};
@@ -658,6 +1034,16 @@ onMounted(() => {
   // 直接复用 store 里的旧数据会让「AI 文案」列显示成过期的"无"。
   // 静默刷新，不弹「刷新成功」。
   fetchMaterials(true)
+})
+
+onBeforeUnmount(() => {
+  // 定时器不跟着组件一起走的话，离开页面后还会一直请求后端
+  stopComposePolling()
+  if (statusTimer) {
+    clearInterval(statusTimer)
+    statusTimer = null
+  }
+  stopMusicPreview()
 })
 </script>
 
@@ -888,6 +1274,56 @@ onMounted(() => {
   color: #909399;
   font-size: 12px;
 }
+
+/* 合成背景音乐 */
+.bgm-compose {
+  padding: 0 4px;
+
+  .bgm-material {
+    margin: 14px 0 10px;
+    font-size: 13px;
+    color: $text-regular;
+    word-break: break-all;
+  }
+
+  .bgm-picker {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+
+    .bgm-select {
+      flex: 1;
+    }
+  }
+
+  /* 下拉里把时长放到右侧，选的时候能看出音乐长短 */
+  .bgm-option-meta {
+    float: right;
+    color: #909399;
+    font-size: 12px;
+  }
+
+  .bgm-hint {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #909399;
+  }
+
+  .bgm-progress {
+    margin-top: 18px;
+
+    .bgm-progress-text {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #909399;
+      word-break: break-all;
+    }
+  }
+}
+
 .mt12 {
   margin-top: 12px;
 }

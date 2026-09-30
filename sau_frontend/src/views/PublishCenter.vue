@@ -175,7 +175,8 @@
         <div class="card-header">
           <span>④ 发布</span>
           <span class="hint">
-            将按「素材 × 平台 × 账号」拆成 {{ taskCount }} 个发布任务，每个账号一条通道并行跑
+            将按「素材 × 平台 × 账号」拆成 {{ taskCount }} 个发布任务，每个账号一条通道并行跑；
+            同一个账号已经发过的素材，提交前会再确认一次
           </span>
         </div>
       </template>
@@ -191,6 +192,9 @@
           开始发布
         </el-button>
         <el-button v-if="publishing" @click="cancelPending">取消未开始的任务</el-button>
+        <el-button v-if="publishing" type="danger" plain @click="cancelAllRunning">
+          中断全部未完成
+        </el-button>
         <el-button v-if="jobId" @click="goRecords">查看发布记录</el-button>
         <span class="hint ml12">
           {{
@@ -300,6 +304,22 @@
             <el-table-column label="耗时" width="80">
               <template #default="{ row }">{{ formatDuration(row) }}</template>
             </el-table-column>
+            <el-table-column label="操作" width="90" fixed="right">
+              <template #default="{ row }">
+                <!-- 有任务卡着不想等就点这里：排队中的、正在跑的都能中断 -->
+                <el-button
+                  v-if="row.cancellable"
+                  size="small"
+                  type="danger"
+                  plain
+                  :loading="cancelling[row.task_id]"
+                  @click="interruptTask(row)"
+                >
+                  中断
+                </el-button>
+                <span v-else class="hint">—</span>
+              </template>
+            </el-table-column>
           </el-table>
         </div>
       </template>
@@ -332,6 +352,46 @@
         <span class="hint">已选 {{ pendingMaterials.length }} 个</span>
         <el-button @click="materialDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="confirmMaterials">加入发布列表</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 同一个账号已经发过的素材：二次确认（默认不显示，点「开始发布」时查到重复才弹） -->
+    <el-dialog
+      v-model="repeatDialogVisible"
+      title="这些内容这个账号已经发过了"
+      width="720px"
+      top="10vh"
+    >
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="同一个账号再发一次同一条素材，平台上就会多出一条重复内容"
+        description="可能是素材还留在发布列表里、又点了一遍；也可能你确实想重发。核对无误再继续。"
+      />
+      <el-table :data="repeatConflicts" size="small" max-height="320" class="mt12">
+        <el-table-column label="素材" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.material_title || row.material }}</template>
+        </el-table-column>
+        <el-table-column label="平台 / 账号" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.platform_name }} · {{ row.account_name }}</template>
+        </el-table-column>
+        <el-table-column label="上次发布" min-width="230" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.message }}</template>
+        </el-table-column>
+        <el-table-column label="来源" width="110">
+          <template #default="{ row }">{{ row.last_source_text || '—' }}</template>
+        </el-table-column>
+      </el-table>
+      <div class="hint mt8">
+        这一批共 {{ repeatTaskCount }} 条任务（素材 × 账号），其中 {{ repeatConflicts.length }} 条此前已经发过。
+        确认后这次提交会在任务日志里记一句"已确认重发"，事后翻发布记录能分清。
+      </div>
+      <template #footer>
+        <el-button @click="repeatDialogVisible = false">我再看看</el-button>
+        <el-button type="danger" :loading="submitting" @click="confirmRepeatAndPublish">
+          确认，继续发布
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -379,9 +439,17 @@ const jobStatus = ref('')
 const summary = ref({ total: 0, queued: 0, running: 0, success: 0, failed: 0, cancelled: 0, interrupted: 0, done: 0, percent: 0 })
 const tasks = ref([])
 const details = ref({})
+//: 正在中断的任务（按钮转圈用）。按 task_id 记，避免整表一起转
+const cancelling = ref({})
 //: 整机同时最多开几个浏览器（后端 SAU_MAX_CONCURRENT_BROWSERS），界面上要说清楚，
 //: 否则用户看到"明明选了 4 个平台却只跑了 2 个"，会以为是坏了
 const maxConcurrent = ref(4)
+//: 「这个账号已经发过这条素材」的组合。点「开始发布」时后端查出来的，
+//: 有它就弹窗让人确认——发重了平台上就是两条重复内容
+const repeatConflicts = ref([])
+//: 这一批一共要发多少条（素材 × 账号），弹窗里好说"N 条里有 M 条发过"
+const repeatTaskCount = ref(0)
+const repeatDialogVisible = ref(false)
 let pollTimer = null
 
 const filteredMaterials = computed(() => {
@@ -606,8 +674,29 @@ function togglePlatform(key, checked) {
 // 提交 + 轮询进度
 // --------------------------------------------------------------------------- //
 
-function buildPayload() {
-  const payloadItems = items.value
+function buildPayload(confirmedRepeat = false) {
+  return {
+    items: publishItems(),
+    targets: publishTargets(),
+    options: {
+      isOriginal: isOriginal.value,
+      isDraft: isDraft.value,
+      enableTimer: scheduleEnabled.value,
+      videosPerDay: videosPerDay.value,
+      dailyTimes: dailyTimes.value,
+      startDays: startDays.value,
+      productLink: productLink.value,
+      productTitle: productTitle.value,
+      thumbnail: '',
+      // 用户已经在「这个账号发过了」的弹窗里点过确认；后端据此把重复发布写进任务日志
+      confirmRepublish: !!confirmedRepeat
+    }
+  }
+}
+
+/** 要发的素材（跟 buildPayload 同一套筛选：没有标题也没有正文的不算一条） */
+function publishItems() {
+  return items.value
     .filter((item) => item.title.trim() || item.desc.trim())
     .map((item) => ({
       material: item.name,
@@ -618,32 +707,68 @@ function buildPayload() {
         .map((t) => t.trim().replace(/^#/, ''))
         .filter(Boolean)
     }))
+}
 
-  const targets = selectedPlatforms.value
+/** 要发的「平台 + 账号」组合 */
+function publishTargets() {
+  return selectedPlatforms.value
     .filter((key) => platformAccounts[key]?.length)
     .map((key) => ({ platform: key, account_ids: [...platformAccounts[key]] }))
+}
 
-  return {
-    items: payloadItems,
-    targets,
-    options: {
-      isOriginal: isOriginal.value,
-      isDraft: isDraft.value,
-      enableTimer: scheduleEnabled.value,
-      videosPerDay: videosPerDay.value,
-      dailyTimes: dailyTimes.value,
-      startDays: startDays.value,
-      productLink: productLink.value,
-      productTitle: productTitle.value,
-      thumbnail: ''
-    }
+/**
+ * 查这批里有没有「同一个账号已经发过的素材」，返回后端那坨数据（没有则 null）。
+ *
+ * 查不了就当没有（老后端没这个接口、网络抖一下都算）：重复发布最坏是多一条重复内容，
+ * 而卡住发布是更糟的体验——所以这里任何异常都不挡发布。
+ */
+async function fetchRepeatCheck() {
+  try {
+    const res = await publishApi.checkPublished({
+      items: publishItems(),
+      targets: publishTargets()
+    })
+    if (res.code !== 200) return null
+    return res.data || null
+  } catch (e) {
+    return null
   }
 }
 
 async function doPublish() {
+  if (repeatDialogVisible.value) return
   submitting.value = true
   try {
-    const res = await publishApi.submit(buildPayload())
+    // 先问一次"这些素材这个账号是不是发过了"：发重了平台上就是两条重复内容，
+    // 得让用户明确知道再发（确认结果会跟着 options.confirmRepublish 一起提交）
+    const check = await fetchRepeatCheck()
+    if (check?.conflicts?.length) {
+      repeatConflicts.value = check.conflicts
+      repeatTaskCount.value = check.task_count || 0
+      repeatDialogVisible.value = true
+      return
+    }
+    await submitPublish(false)
+  } finally {
+    submitting.value = false
+  }
+}
+
+/** 弹窗里点了「确认，继续发布」：带着确认标记再提交一次 */
+async function confirmRepeatAndPublish() {
+  repeatDialogVisible.value = false
+  submitting.value = true
+  try {
+    await submitPublish(true)
+  } finally {
+    submitting.value = false
+  }
+}
+
+/** 真正提交批次。`confirmedRepeat` = 用户已经看过「这个账号发过了」的提示 */
+async function submitPublish(confirmedRepeat) {
+  try {
+    const res = await publishApi.submit(buildPayload(confirmedRepeat))
     if (res.code !== 200) return
     jobId.value = res.data.job_id
     details.value = {}
@@ -652,8 +777,6 @@ async function doPublish() {
     startPolling()
   } catch (e) {
     /* 拦截器已提示 */
-  } finally {
-    submitting.value = false
   }
 }
 
@@ -710,7 +833,7 @@ async function cancelPending() {
   if (!jobId.value) return
   try {
     await ElMessageBox.confirm(
-      '只会取消还没开始的任务；正在执行的那一条不受影响（浏览器操作没法安全中断）。',
+      '只会取消还没开始的任务；正在执行的那一条不受影响（想连它一起停，用「中断全部未完成」或表格里的「中断」）。',
       '取消未开始的任务',
       { type: 'warning', confirmButtonText: '确认取消', cancelButtonText: '再等等' }
     )
@@ -721,6 +844,67 @@ async function cancelPending() {
     const res = await publishApi.cancelJob(jobId.value)
     if (res.code === 200) {
       ElMessage.success(res.msg || '已取消')
+      await refreshJob()
+    }
+  } catch (e) {
+    /* 拦截器已提示 */
+  }
+}
+
+/** 中断单个任务（排队中的 / 正在跑的都能中断）。 */
+async function interruptTask(row) {
+  const running = row.status === 'running'
+  try {
+    await ElMessageBox.confirm(
+      running
+        ? `正在中断「${row.material_title || row.material}」的发布。\n\n` +
+          '它可能已经把内容提交到平台、也可能只发了一半，请中断后到平台确认一次。' +
+          '底层是浏览器自动化，线程未必马上停下，但这个任务不会一直卡着，' +
+          '同一账号后面排队的任务会立刻往下走。'
+        : `取消「${row.material_title || row.material}」这条还没开始的任务？`,
+      running ? '中断正在跑的发布' : '取消未开始的任务',
+      {
+        type: 'warning',
+        confirmButtonText: running ? '确认中断' : '确认取消',
+        cancelButtonText: '再等等'
+      }
+    )
+  } catch (e) {
+    return
+  }
+  cancelling.value = { ...cancelling.value, [row.task_id]: true }
+  try {
+    const res = await publishApi.cancelTask(row.task_id)
+    if (res.code === 200) {
+      ElMessage.success(res.msg || '已中断')
+      await refreshJob()
+    }
+  } catch (e) {
+    /* 拦截器已提示 */
+  } finally {
+    const next = { ...cancelling.value }
+    delete next[row.task_id]
+    cancelling.value = next
+  }
+}
+
+/** 中断这一批里所有还没结束的任务（含正在跑的）。 */
+async function cancelAllRunning() {
+  if (!jobId.value) return
+  try {
+    await ElMessageBox.confirm(
+      `会中断这一批里所有还没结束的任务，包括正在发布的 ${summary.value.running} 个。\n\n` +
+        '正在跑的已经可能把内容交到平台了，请中断后到平台确认一次。',
+      '中断全部未完成的任务',
+      { type: 'warning', confirmButtonText: '确认中断', cancelButtonText: '再等等' }
+    )
+  } catch (e) {
+    return
+  }
+  try {
+    const res = await publishApi.cancelJob(jobId.value, { running: true })
+    if (res.code === 200) {
+      ElMessage.success(res.msg || '已中断')
       await refreshJob()
     }
   } catch (e) {

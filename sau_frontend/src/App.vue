@@ -1,10 +1,16 @@
 <template>
   <div id="app">
-    <el-container>
+    <!--
+      登录页要占满整屏（它自带背景），不能套侧边栏 / 顶栏那层布局。
+      是否整屏由路由 meta.blank 决定，见 router/index.js。
+    -->
+    <router-view v-if="isBlankLayout" />
+
+    <el-container v-else>
       <el-aside :width="isCollapse ? '64px' : '200px'">
         <div class="sidebar">
           <div class="logo">
-            <img v-show="isCollapse" src="/vite.svg" alt="Logo" class="logo-img">
+            <img v-show="isCollapse" src="/logo.svg" alt="Logo" class="logo-img">
             <h2 v-show="!isCollapse">自媒体自动化运营系统</h2>
           </div>
           <el-menu
@@ -28,6 +34,10 @@
               <el-icon><Picture /></el-icon>
               <span>素材管理</span>
             </el-menu-item>
+            <el-menu-item index="/background-music">
+              <el-icon><Headset /></el-icon>
+              <span>背景音乐</span>
+            </el-menu-item>
             <el-menu-item index="/publish-center">
               <el-icon><Upload /></el-icon>
               <span>发布中心</span>
@@ -40,9 +50,9 @@
               <el-icon><Promotion /></el-icon>
               <span>小红书工作台</span>
             </el-menu-item>
-            <el-menu-item index="/model-settings">
+            <el-menu-item index="/settings">
               <el-icon><Setting /></el-icon>
-              <span>模型设置</span>
+              <span>设置</span>
             </el-menu-item>
             <el-menu-item index="/about">
               <el-icon><DataAnalysis /></el-icon>
@@ -58,7 +68,19 @@
               <el-icon class="toggle-sidebar" @click="toggleSidebar"><Fold /></el-icon>
             </div>
             <div class="header-right">
-              <!-- 账号信息已移除 -->
+              <!-- 当前登录用户 + 退出（at-ai-xhs 改造新增） -->
+              <el-dropdown @command="onUserCommand">
+                <span class="user-dropdown">
+                  <el-icon><UserFilled /></el-icon>
+                  <span class="username">{{ userStore.username || 'admin' }}</span>
+                  <el-icon><ArrowDown /></el-icon>
+                </span>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="logout">退出登录</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </div>
           </div>
         </el-header>
@@ -74,6 +96,7 @@
       放在布局层而不是发布中心里：验证码等的是人，跟用户此刻停在哪个页面无关。
     -->
     <el-dialog
+      v-if="!isBlankLayout"
       v-model="promptVisible"
       :title="activePrompt?.title || '需要你输入'"
       width="460px"
@@ -110,21 +133,32 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
-  HomeFilled, User, DataAnalysis,
-  Fold, Picture, Upload, Promotion, Setting, Tickets
+  HomeFilled, User, DataAnalysis, UserFilled, ArrowDown,
+  Fold, Picture, Upload, Promotion, Setting, Tickets, Headset
 } from '@element-plus/icons-vue'
 import { publishApi } from '@/api/publish'
+import { authApi } from '@/api/auth'
+import { useUserStore } from '@/stores/user'
 
 const route = useRoute()
+const router = useRouter()
+const userStore = useUserStore()
 
-// 当前激活的菜单项
+// 当前激活的菜单项。
+// 用 matched 里的记录路径而不是 route.path：设置页保留了老地址 `/model-settings` 作为别名
+// （收藏 / 老链接还在用），走别名进来时 route.path 是 `/model-settings`，
+// 直接比就会高亮不到「设置」这一项。
 const activeMenu = computed(() => {
-  return route.path
+  const last = route.matched[route.matched.length - 1]
+  return last?.path || route.path
 })
+
+// 登录页（meta.blank）要整屏显示，不套侧边栏／顶栏，也不轮询发布弹窗
+const isBlankLayout = computed(() => !!route.meta.blank)
 
 // 侧边栏折叠状态
 const isCollapse = ref(false)
@@ -132,6 +166,36 @@ const isCollapse = ref(false)
 // 切换侧边栏折叠状态
 const toggleSidebar = () => {
   isCollapse.value = !isCollapse.value
+}
+
+// ---- 登录态 ----------------------------------------------------------------
+// 退出登录：清本地 token 回登录页就够了——后端签发的 token 是无状态的，
+// 没有服务端会话要销毁（要作废所有已发的 token 就换 settings.json 里的 auth.secret_key）。
+function onUserCommand(command) {
+  if (command !== 'logout') return
+  userStore.logout()
+  ElMessage.success('已退出登录')
+  router.replace('/login')
+}
+
+/**
+ * 启动时验一次本地 token 是否还有效。
+ *
+ * 路由守卫读的是 localStorage，只能判断"有没有 token"，判断不了"还有没有效"
+ * （比如后端换了 auth.secret_key，或者过了 7 天）。这里问一次后端，
+ * 无效就清掉，免得用户进来先看到一屏报错。
+ */
+async function verifySession() {
+  if (!userStore.isLoggedIn) return
+  try {
+    const res = await authApi.status()
+    if (!res.data?.authenticated) {
+      userStore.logout()
+      router.replace('/login')
+    }
+  } catch (e) {
+    // 后端没起来 / 网络不通：不动登录态，让用户自己去点一下看报什么错
+  }
 }
 
 // ---- 发布途中的"等人输入"弹窗（抖音短信验证码等） ----------------------------
@@ -226,16 +290,37 @@ async function skipPrompt() {
   }
 }
 
-onMounted(() => {
+// 只在"已登录且不在登录页"时轮询。放在登录页上跑的话，每 2 秒一次 401，
+// 会不停地弹"登录已过期"，把人从登录页反复踢来踢去。
+function startPromptPolling() {
+  if (promptTimer) return
   pollPrompts()
   promptTimer = setInterval(pollPrompts, 2000)
-})
+}
 
-onBeforeUnmount(() => {
+function stopPromptPolling() {
   if (promptTimer) {
     clearInterval(promptTimer)
     promptTimer = null
   }
+  activePrompt.value = null
+}
+
+watch(
+  () => [isBlankLayout.value, userStore.isLoggedIn],
+  ([blank, authed]) => {
+    if (!blank && authed) startPromptPolling()
+    else stopPromptPolling()
+  },
+  { immediate: true }
+)
+
+onMounted(() => {
+  verifySession()
+})
+
+onBeforeUnmount(() => {
+  stopPromptPolling()
 })
 </script>
 
@@ -332,15 +417,17 @@ onBeforeUnmount(() => {
         display: flex;
         align-items: center;
         cursor: pointer;
-        
+        outline: none;
+
+        .el-icon {
+          font-size: 14px;
+          color: $text-secondary;
+        }
+
         .username {
           margin: 0 8px;
+          font-size: $font-size-base;
           color: $text-regular;
-        }
-        
-        .el-icon {
-          font-size: 12px;
-          color: $text-secondary;
         }
       }
     }
