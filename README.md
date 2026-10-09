@@ -174,7 +174,7 @@ cd sau_frontend && npm run dev
 ====================================================================
 🔐 已生成后台登录密码（明文保存在 settings.json 的 auth.password）
    账号：admin
-   密码：TeSjqjMAtMgB6ZTq
+   密码：<首次启动时随机生成的 16 位密码>
    改密码：编辑 settings.json 的 auth.password，或删掉该字段后重启
 ====================================================================
 ```
@@ -186,7 +186,7 @@ cd sau_frontend && npm run dev
   "vision": { "...": "模型配置" },
   "auth": {
     "username": "admin",
-    "password": "TeSjqjMAtMgB6ZTq",
+    "password": "……首次启动时随机生成的 16 位密码……",
     "secret_key": "……token 的签名密钥……",
     "created_at": "2026-09-30 09:51:16"
   }
@@ -201,6 +201,9 @@ cd sau_frontend && npm run dev
 
 > 密码和 API Key 一样是**明文**存的（文件权限 600）。这是本地单机工具，
 > 但请知悉：**`settings.json` 已被 `.gitignore` 排除，绝不能提交**。
+> 同理，README / 文档 / 截图里的示例**一律写占位符**，别从 `settings.json` 里抄真实值——
+> 仓库是公开的，值抄进去等于把后台交出去。这里踩过一次（2026-10-09）：示例里的密码就是
+> 当时正在用的那个，只能靠换密码收场。见 `tests/test_no_secret_in_repo.py`。
 
 ### 挡住的范围
 
@@ -729,13 +732,15 @@ GET  /account-stats/summary       所有账号的粉丝数一览：**只读缓�
 .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-34 个测试文件、511 个用例，覆盖小红书页面操作、抖音声明、视频号标注、发布进度/弹窗桥、
-浏览器 CLI 派发、背景音乐合成等。另外两块单独说明：
+35 个测试文件、514 个用例，覆盖小红书页面操作、抖音声明、视频号标注、发布进度/弹窗桥、
+浏览器 CLI 派发、背景音乐合成等。另外三块单独说明：
 `tests/test_web_auth.py`（登录鉴权：密码只生成一次、过期/伪造 token 拒绝、守卫放行范围、
 `auth` 段不被设置接口读写）、`tests/test_background_music.py`（上传 → 合成 → 改名落库，
 其中用 FFT 断言成品的主频是**背景音乐**而不是原视频的——用来证明"换掉了音轨"，
 而不是"只是把音乐叠上去"，顺带覆盖短音乐循环、长音乐截断、反复合成不叠加后缀，
-以及 `.MOV` 里装 av1 的素材：必须自动改走 mp4 封装，否则 ffmpeg 写头就失败）。
+以及 `.MOV` 里装 av1 的素材：必须自动改走 mp4 封装，否则 ffmpeg 写头就失败）、
+`tests/test_no_secret_in_repo.py`（拿本机 `settings.json` 里的真实密码 / API Key 去扫全部
+已入库文件，防止"把正在用的值抄进文档"再发生一次，见[登录与鉴权](#登录与鉴权)）。
 
 浏览器里的验收脚本（需要前后端都已启动）：
 
@@ -752,7 +757,7 @@ cd sau_frontend && npm run build                 # 它用 dist 的构建产物�
 .venv/bin/python tools/verify_bgm_page.py        # 上传音乐 → 合成 → 改名/状态/成品校验
 ```
 
-> ⚠️ 当前 **506 过 / 5 未过**：失败项集中在 `test_sau_browser_cli`（CLI 参数名与本地改造后的
+> ⚠️ 当前 **509 过 / 5 未过**：失败项集中在 `test_sau_browser_cli`（CLI 参数名与本地改造后的
 > 上游版本不一致）、`test_douyin_declaration`。属于历史遗留的过期断言，
 > 与文档/忽略规则无关，待单独修。
 
