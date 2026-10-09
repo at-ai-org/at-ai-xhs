@@ -18,11 +18,12 @@
 没有真实响应可用（见 `myUtils/account_stats/tencent.py` 的说明）。
 """
 
+import asyncio
 import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -380,8 +381,27 @@ class TencentParsingTest(unittest.TestCase):
         self.assertEqual(series[0]["date"], "2026-07-02")
         self.assertEqual(series[-1]["date"], "2026-07-04")
 
+    def test_daily_series_keeps_the_extra_bucket_for_today(self):
+        """要 7 天，平台返回 **8** 段（含今天）——不能按 7 截断。
+
+        实测：`interval=3` 是按天、首尾都算在内，30 天给 31 段，而 7 天那份就是 30 天那份的
+        最后 8 个。按 `days` 截断会正好把"今天"丢掉，也就是刚发完视频的那天。
+        """
+        week = [36, 30, 69, 20, 17, 13, 17, 1]
+        series = _daily_series(week, start_ts=1783000000, days=7)
+        self.assertEqual([row["count"] for row in series], week)
+        self.assertEqual(len(series), 8)
+
+        # 30 天的最后 8 段和 7 天那份逐位相同（这就是"按天、含首尾"的证据）
+        month = [0] * 23 + week
+        month_series = _daily_series(month, start_ts=1783000000, days=30)
+        self.assertEqual([row["count"] for row in month_series][-8:], week)
+
+        # 多到离谱的响应（平台改了口径）还是要挡住，别画出一堆没有意义的点
+        self.assertEqual(len(_daily_series([1] * 500, start_ts=1783000000, days=7)), 8)
+
     def test_daily_series_accepts_object_shape_too(self):
-        """真实形状待确认，两种都认（对象里还可能自带 date）。"""
+        """对象形状保留兼容（真实响应是纯数组，见上一条）。"""
         series = _daily_series(
             [{"count": 5}, {"value": 6}, {"date": "2026-09-30", "count": 7}],
             start_ts=1783000000,
@@ -389,6 +409,30 @@ class TencentParsingTest(unittest.TestCase):
         )
         self.assertEqual([row["count"] for row in series], [5, 6, 7])
         self.assertEqual(series[-1]["date"], "2026-09-30")
+
+    def test_total_data_uses_the_summary_endpoint_short_keys(self):
+        """账号级汇总是**短名**（browse/like/comment/forward/fav），用长名一个都对不上。
+
+        真实响应（2026-10-09 实测，`statistic/post_total_data`，7 天）：
+        `{"browse": [36,30,69,20,17,13,17,1], "like": [...], "comment": [...],
+          "forward": [...], "fav": [...]}`
+        照前端 bundle 那套长名（`readCount` / `likeCount`…）去认，互动那一整块都是空的，
+        界面看着像"这个号没有任何互动"。
+        """
+        real = {
+            "browse": [36, 30, 69, 20, 17, 13, 17, 1],
+            "like": [0, 0, 0, 0, 0, 0, 0, 0],
+            "comment": [1, 0, 0, 0, 0, 0, 0, 0],
+            "forward": [2, 0, 0, 1, 0, 0, 0, 0],
+            "fav": [0, 0, 0, 0, 0, 0, 0, 0],
+        }
+        period = _period_from_total_data(real, start_ts=1783000000, days=7)
+        self.assertEqual(period["view_count"], sum(real["browse"]))
+        self.assertEqual(period["like_count"], 0)
+        self.assertEqual(period["comment_count"], 1)
+        self.assertEqual(period["share_count"], 3)
+        self.assertEqual(period["collect_count"], 0)
+        self.assertEqual(len(period["series"]["view_count"]), 8)
 
     def test_total_data_sums_daily_values(self):
         period = _period_from_total_data(
@@ -411,6 +455,35 @@ class TencentParsingTest(unittest.TestCase):
         # 但趋势图还是要画出来的
         self.assertEqual(len(period["series"]["video_full_view_rate"]), 3)
 
+    def test_account_level_summary_has_no_fans_or_completion_rate(self):
+        """账号级汇总**不给**涨粉数和完播率 → 这两个 key 缺就是缺，不能变成 0。
+
+        （作品列表里那一行才有 `followCount` / `fullPlayRate`，见下一条。）
+        """
+        period = _period_from_total_data(
+            {"browse": [1, 2], "like": [0, 0]}, start_ts=1783000000, days=1
+        )
+        self.assertNotIn("rise_fans_count", period)
+        self.assertNotIn("video_full_view_rate", period)
+
+    def test_avatar_url_gets_the_size_suffix_wechat_cdn_requires(self):
+        """微信头像地址不补尺寸后缀 → CDN 直接 400（实测），本地就永远没有头像。
+
+        实测：`https://wx.qlogo.cn/mmhead/ver_1/<hash>` 返回 400 且响应体为空；
+        加 `/0`（原图，约 30KB）或 `/132` 才是 200 + `image/jpeg`。
+        """
+        from myUtils.account_stats.tencent import _avatar_url
+
+        base = "https://wx.qlogo.cn/mmhead/ver_1/Wia51SRXS9t1S39"
+        self.assertEqual(_avatar_url(base), base + "/0")
+        # 已经带尺寸的不要重复加
+        self.assertEqual(_avatar_url(base + "/132"), base + "/132")
+        self.assertEqual(_avatar_url(base + "/0?x=1"), base + "/0?x=1")
+        # 其它平台的 CDN 没这个规矩，一个字符都别动
+        xhs = "https://sns-avatar-qc.xhscdn.com/avatar/abc123"
+        self.assertEqual(_avatar_url(xhs), xhs)
+        self.assertIsNone(_avatar_url(None))
+
     def test_post_item_maps_wechat_channels_field_names(self):
         item = _post_item(
             {
@@ -432,6 +505,257 @@ class TencentParsingTest(unittest.TestCase):
         self.assertEqual(item["shares"], 1)
         self.assertEqual(item["rise_fans"], 4)
         self.assertEqual(item["full_view_rate"], 50.0)
+
+
+# --------------------------------------------------------------------------- #
+# 视频号取数用的**是哪个浏览器 profile**
+# --------------------------------------------------------------------------- #
+
+
+class TencentSessionProfileTest(unittest.TestCase):
+    """视频号取数必须落在**账号自己的**持久化 profile 上（`uin_<微信号>`）。
+
+    回归 2026-10-09 的真实事故：适配器传 `seed=False`（本意是"别拿 cookie 文件里那条可能
+    已经死掉的 sessionid 去顶 profile"），而 session 层里 `seed=False` 的含义是"**用一个全新
+    的临时 profile**"——于是每次取数都在 `_login_<随机>` 的空白 profile 里开浏览器，里面一条
+    登录态都没有，数据中心整页跳登录页。界面上的表现极具误导性：
+
+    * 同一个账号，10:00:34 / 10:01:23 / 10:03:33 三次 `cookie_auth` 全是「cookie 有效」
+      （它走的是 `uin_<微信号>` 那个 profile），10:00:43 的取数却报"未登录状态"；
+    * 用户按提示反复重新扫码，扫多少次都没用——因为问题不在账号，在取数拿错了 profile；
+    * 每次取数还顺手留下一个 ~18MB 的 `_login_*` 目录（一天攒了 15 个）。
+    """
+
+    UIN = "3431959778"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+
+        # profile 根目录换到临时目录：别在仓库的 cookies/ 下留垃圾。
+        # `profile_root()` 每次调用都读这个模块级常量，所以 patch 生效。
+        self.profile_root = root / "tencent_uploader"
+        for target, value in (
+            ("uploader.tencent_uploader.session.TENCENT_PROFILE_ROOT", self.profile_root),
+            ("myUtils.account_stats.tencent.BASE_DIR", root),
+        ):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        # 账号文件按适配器的约定放在 <BASE_DIR>/cookiesFile/ 下。
+        # 内容和真实文件同构：视频号的账号 JSON 里只有 channels 域的两条 cookie。
+        cookies_dir = root / "cookiesFile"
+        cookies_dir.mkdir()
+        self.account_file = cookies_dir / "acct.json"
+        self.account_file.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "s",
+                            "domain": ".channels.weixin.qq.com",
+                            "path": "/",
+                        },
+                        {
+                            "name": "wxuin",
+                            "value": self.UIN,
+                            "domain": ".channels.weixin.qq.com",
+                            "path": "/",
+                        },
+                    ],
+                    "origins": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.launched: dict = {}
+
+    # --- 替身：只记录"用了哪个 profile"，不开真浏览器 ------------------------- #
+
+    def _fake_playwright(self):
+        """假的 patchright：把 `launch_persistent_context` 拿到的目录记下来。
+
+        页面内的请求按**真实抓到的响应形状**回放（2026-10-09 从 `channels.weixin.qq.com`
+        抄下来的，只截短了数组）——这样"字段名对不对"能在单元测试里钉住，
+        不必每次真开浏览器去核。
+        """
+        launched = self.launched
+
+        responses = {
+            # 实测：7 天给 8 段（含今天），total 是逐日累计
+            "/statistic/fans_trend": {
+                "add": [0, 0, 0, 0, 0, 0, 0, 0],
+                "reduce": [0, 0, 0, 0, 0, 0, 0, 0],
+                "netAdd": [0, 0, 0, 0, 0, 0, 0, 0],
+                "total": [13, 13, 13, 13, 13, 13, 13, 13],
+            },
+            # 实测：账号级汇总用的是短名
+            "/statistic/post_total_data": {
+                "browse": [36, 30, 69, 20, 17, 13, 17, 1],
+                "like": [0, 0, 0, 0, 0, 0, 0, 0],
+                "comment": [1, 0, 0, 0, 0, 0, 0, 0],
+                "forward": [2, 0, 0, 1, 0, 0, 0, 0],
+                "fav": [0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            # 实测：作品行确实用长名
+            "/statistic/post_list": {
+                "list": [
+                    {
+                        "objectId": "abc123",
+                        "createTime": 1790673353,
+                        "desc": {"description": "城市海岸线的日落"},
+                        "readCount": 7,
+                        "likeCount": 1,
+                        "favCount": 2,
+                        "commentCount": 0,
+                        "forwardAggregationCount": 0,
+                        "followCount": 0,
+                        "fullPlayRate": 0.5,
+                    }
+                ],
+                "totalCount": 45,
+            },
+            # 实测：昵称 / 头像在 userAttr 里，不在顶层
+            "/auth/auth_wx": {
+                "displayWordingList": [],
+                "userAttr": {
+                    "nickname": "麻辣香锅",
+                    "encryptedUsername": "AOA****888",
+                    "encryptedHeadImage": "https://wx.qlogo.cn/mmhead/ver_1/abc",
+                },
+                "finderLoginStatus": 1,
+            },
+        }
+
+        class FakePage:
+            url = "about:blank"
+
+            async def goto(self, url, **kwargs):
+                self.url = url
+
+            async def wait_for_timeout(self, ms):
+                return None
+
+            async def evaluate(self, expression, arg=None):
+                # 一个参数的那次是"页面在不在登录页"，页面正常 → False；
+                # 两个参数的是页面内 fetch，按上面的表回放。
+                if arg is None:
+                    return False
+                path = arg[0]
+                for suffix, data in responses.items():
+                    if path.endswith(suffix):
+                        return {
+                            "ok": True,
+                            "body": json.dumps({"errCode": 0, "data": data}),
+                        }
+                raise AssertionError(f"测试没准备这个接口的响应：{path}")
+
+            async def close(self):
+                return None
+
+        class FakeContext:
+            async def add_init_script(self, path=None):
+                return None
+
+            async def new_page(self):
+                return FakePage()
+
+            async def close(self):
+                return None
+
+        class FakeChromium:
+            async def launch_persistent_context(self, target, **kwargs):
+                launched["target"] = str(target)
+                return FakeContext()
+
+            async def launch(self, **kwargs):
+                # 降级路径（profile 被占用）才会走到这里：本次测试不该出现
+                launched["ephemeral"] = True
+                raise AssertionError("不该走一次性 context 的降级路径")
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        @asynccontextmanager
+        async def fake_async_playwright():
+            yield FakePlaywright()
+
+        return fake_async_playwright
+
+    def test_stats_fetch_uses_the_accounts_own_profile(self):
+        """取数用的是 `uin_<微信号>`，不是 `_login_<随机>` 空 profile。"""
+        from myUtils.account_stats import tencent
+
+        with patch("playwright.async_api.async_playwright", self._fake_playwright()):
+            tencent.fetch("acct.json", "测试账号")
+
+        self.assertEqual(Path(self.launched["target"]).name, f"uin_{self.UIN}")
+        # 一个临时 profile 都不许留下：这正是那次事故的"痕迹"
+        self.assertEqual([p.name for p in self.profile_root.glob("_login_*")], [])
+
+    def test_stats_fetch_maps_the_real_response_shapes(self):
+        """真实响应形状走一遍完整链路：粉丝 / 互动 / 作品 / 昵称头像都要落到位。"""
+        from myUtils.account_stats import tencent
+
+        with patch("playwright.async_api.async_playwright", self._fake_playwright()):
+            stats = tencent.fetch("acct.json", "测试账号")
+
+        account = stats["account"]
+        # 昵称 / 头像在 auth_wx.userAttr 里；按顶层取就永远是空的。
+        # 头像地址还要补上微信 CDN 要求的尺寸后缀（否则下载 400）。
+        self.assertEqual(account["nickname"], "麻辣香锅")
+        self.assertEqual(account["avatar"], "https://wx.qlogo.cn/mmhead/ver_1/abc/0")
+
+        # 关注者总数取 fans_trend.total 的最后一段
+        self.assertEqual(stats["fans"]["count"], 13)
+
+        # 互动：短名要认出来，否则界面像"零互动"
+        period = stats["engagement"]["periods"]["7d"]
+        self.assertEqual(period["view_count"], sum([36, 30, 69, 20, 17, 13, 17, 1]))
+        self.assertEqual(period["comment_count"], 1)
+        self.assertEqual(period["share_count"], 3)
+
+        # 作品列表用长名，两套名字各归各的
+        media = stats["media"]
+        self.assertTrue(media["supported"])
+        self.assertEqual(media["total"], 45)
+        item = media["items"][0]
+        self.assertEqual(item["views"], 7)
+        self.assertEqual(item["likes"], 1)
+        self.assertEqual(item["collects"], 2)
+        self.assertEqual(item["full_view_rate"], 50.0)
+
+    def test_seed_false_with_account_file_and_no_profile_dir_is_refused(self):
+        """`account_file` + `seed=False` + 不给 `profile_dir` 是误用，直接拒绝。
+
+        以前这个组合**静默**落到空白 profile 上，看起来像"账号掉登录了"——
+        这类"组合出来的分支"必须响亮地失败，否则下次还会有人踩。
+        """
+        from uploader.tencent_uploader import session as ts
+
+        async def run():
+            async with ts.tencent_session(
+                object(), self.account_file, seed=False, persist=False
+            ):
+                pass
+
+        with self.assertRaises(ValueError) as ctx:
+            asyncio.run(run())
+        self.assertIn("profile_dir", str(ctx.exception))
+
+    def test_missing_account_file_is_reported_without_opening_a_browser(self):
+        """账号文件不在 → 一句人话，而且**不为此开一次浏览器**（十几秒白等）。"""
+        from myUtils.account_stats import tencent
+
+        with self.assertRaises(StatsUnavailable) as ctx:
+            tencent.fetch("没有这个文件.json", "测试账号")
+
+        self.assertIn("测试账号", str(ctx.exception))
+        self.assertFalse(self.profile_root.exists(), "不该为一个不存在的账号建 profile 目录")
 
 
 # --------------------------------------------------------------------------- #

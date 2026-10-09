@@ -335,8 +335,11 @@ async def tencent_session(
 
     * `account_file` 给了且 `seed=True` → 用该账号的持久化 profile，并把 JSON 里的
       cookie 注入进去；
-    * `seed=False`（登录用）→ 用一个全新的临时 profile，登录成功后由
-      `finalize_login_profile()` 归位到 `uin_<wxuin>`；
+    * `seed=False`（登录用，**`account_file` 必须同时传 None**）→ 用一个全新的临时
+      profile，登录成功后由 `finalize_login_profile()` 归位到 `uin_<wxuin>`；
+    * 只读查询（账号数据、不想回写）→ 显式传
+      `profile_dir=profile_dir_for(account_file)` + `seed=False` + `persist=False`：
+      用账号自己的设备，但不拿 cookie 文件去顶 profile 里的会话；
     * 退出时（无论成功、失败还是抛异常）都会把 cookie 回写 `account_file`；
     * `fallback_when_busy=True`（只读探测用，比如账号管理页的校验）→ 这个 profile
       正被别的任务占用时**不排队等**，直接降级成一次性 context 去看一眼登录态。
@@ -345,8 +348,26 @@ async def tencent_session(
 
     锁的粒度是 **profile 目录**而不是账号文件：两个指向同一个微信号的账号文件会落进同一个
     profile 目录，而一个 profile 目录同时只能有一个 Chrome 在用。
+
+    `seed=False` 的含义是"**用一个全新的临时 profile**"，不是"别把 cookie 灌进去"
+    ------------------------------------------------------------------------------
+    只有扫码登录该这么用（它连 `account_file` 都不传）。**传了 `account_file` 又 `seed=False`、
+    还不给 `profile_dir`**，会落到 `new_staging_dir()` 的 `_login_<随机>` 空白目录上：里面
+    一条登录态都没有，页面整页跳登录页，调用方看到的是"这个账号未登录"——**看起来像账号掉了，
+    其实是拿错了 profile**。2026-10-09 的账号数据取数就是这么连着错了一整天（账号明明好的）。
+    这种组合一定是误用，所以这里直接拒绝：只读查询要显式传
+    `profile_dir=profile_dir_for(account_file)`（不灌 cookie，但用账号自己的设备）。
     """
     account_path = Path(account_file).expanduser() if account_file else None
+
+    if account_path is not None and not seed and profile_dir is None:
+        raise ValueError(
+            "tencent_session: 传了 account_file 却 seed=False、又没给 profile_dir——"
+            "这会让本次会话落在一个全新的空白 profile（_login_*）上，等于换了一台没登录过的设备。"
+            "只读查询（账号数据、只读校验）请显式传 profile_dir=profile_dir_for(account_file)；"
+            "扫码登录请把 account_file 传 None。"
+        )
+
     if profile_dir is not None:
         target = Path(profile_dir)
     elif account_path is not None and seed:
