@@ -79,3 +79,95 @@ XHS_SCHEDULE_JITTER_MINUTES = 20
 XHS_LOCALE = "zh-CN"
 XHS_TIMEZONE = "Asia/Shanghai"
 XHS_VIEWPORT = {"width": 1440, "height": 900}
+
+# ---- at-ai-xhs 改造新增：拼多多视频（多多视频）----
+#
+# 通道结论（2026-10 调研，详见 docs/拼多多视频接入方案.md）：
+#   拼多多开放平台**没有**视频发布能力，能用的只有官方 PC 后台 `live.pinduoduo.com`。
+#   它一套后台三种身份（商家 / 达人 / 机构），**登录方式各不相同**：
+#     * 达人：/login/anchor，App 扫码（token_type=2）——本项目只做这条；
+#     * 商家：账号密码 / 短信；
+#     * 机构：mcn.pinduoduo.com（另一套域名，仅企业主体）。
+#   发布页里的所有 `/api/backbone/*` 请求都带平台自己算的签名（anti-content），
+#   所以**不要**试图绕过页面直连接口，老老实实走 DOM 自动化（和快手那条路一致：
+#   签名交给页面自己算，我们只负责填表、点按钮、读结果）。
+#: **真正的上传页**。2026-10-08 用真实登录态核对过：
+#: `/n-creator/video/short-video` 只是「发布视频」的**活动/任务落地页**（页面上一个输入框都没有，
+#: 文案是"第1步 点击底部'发布视频'"）；点它的「立即发布短视频」才会跳到 `home`，
+#: 那里才有「上传视频 / 添加视频」和整张视频卡片。走错地址的后果是登录态校验误判失效。
+PDD_PUBLISH_URL = "https://live.pinduoduo.com/n-creator/video/home"
+#: 落地页地址（`short-video`）。只有当 `home` 打不开上传区时才用它兜底：
+#: 进落地页 → 点「立即发布短视频」→ 跳回 `home`（见 `_ensure_upload_page`）。
+PDD_PUBLISH_URL_LEGACY = "https://live.pinduoduo.com/n-creator/video/short-video"
+PDD_LOGIN_URL = "https://live.pinduoduo.com/login/anchor"
+#: 未登录时平台会跳到 /login?isNewCreatorFrom=…&referUrl=…，URL 里出现这个片段即失效。
+PDD_LOGIN_URL_MARKER = "/login"
+#: 内容管理页（发布后校验作品是否真的出现）。
+PDD_MANAGE_URL = "https://live.pinduoduo.com/n-creator/video/video-manage"
+
+# PDD_HEADLESS：拼多多「登录 / 校验 / 发布」共用的无头开关。
+#   默认 True = 和其余平台一致；设 False 或在环境变量里给 SAU_PDD_HEADLESS=0 可切成有头，
+#   首次接入（选择器还没被真实页面验证过）建议有头跑一次，直接看页面比翻日志快。
+PDD_HEADLESS = _env_flag("SAU_PDD_HEADLESS", True)
+
+# PDD_DEBUG_DUMP：每一步都往 pdd_debug/ 里存一份 HTML + 全页截图。
+#   为什么默认从宽：拼多多这条链路是本项目第一个**在写代码时拿不到登录态页面**的平台
+#   （发布页必须登录才渲染），选择器只能按平台前端产物里扒出来的文案先写一版。
+#   所以第一次用真实账号跑时，把开关打开（SAU_PDD_DUMP=1），失败时直接把 dump 目录给我，
+#   改选择器一次到位，而不是靠猜。
+PDD_DEBUG_DUMP = _env_flag("SAU_PDD_DUMP", False)
+PDD_DEBUG_DIR = "pdd_debug"
+
+# 发布页的硬约束（从平台发布页前端产物里读出来的，不是猜的）。
+#
+# ⚠️ 最容易搞反的一条：**视频发布没有「标题」字段**。
+#   平台的发布载荷里 `title` 只出现在 `feedType === IMAGE`（图文）那一支，
+#   视频那一支只有 `desc / cover / vid / scheduleTime / goodsIdList / cutStartTime…`；
+#   发布页上那个 placeholder="添加标题" 的输入框，渲染条件也是 `feedType === IMAGE`。
+#   所以发布中心的「标题」**必须并进描述**，否则用户写的标题无处安放（见
+#   uploader/pdd_uploader/main.py 的 _compose_desc）。
+#   标题 ≤40 字 / 不能带 # 这两条是**图文**的校验规则，这里保留是为了兜住"平台哪天给
+#   视频也加上标题框"（驱动检测到标题框就填，检测不到就并进描述）。
+PDD_TITLE_MAX = 40
+PDD_DESC_MAX = 500
+#: 单个话题最长字数（平台的联想输入会提示「话题长度不可超过15个字」）。
+PDD_TOPIC_MAX = 15
+#: 一条视频最多能带几个话题（平台提示「最多可以添加5个相关话题」，编辑器里 limit:5）。
+PDD_TOPIC_MAX_COUNT = 5
+
+#: 封面要求（平台文案：「需上传封面比例为3:4且分辨率大于720P；文件大小不超过5M」）。
+#: 自动生成的封面（抽视频首帧）必须按这个规格裁/补，否则平台不收。
+PDD_COVER_RATIO = (3, 4)
+PDD_COVER_MIN_WIDTH = 720
+PDD_COVER_MAX_MB = 5.0
+
+#: 视频要求（平台文案：mp4 优先、1080P 及以上、帧率 ≥ 24、码率 ≥ 6Mbps；竖版更容易拿到流量）。
+#: 这几条只做提示，不拦发布——本地转码不在本工具的职责范围内。
+PDD_VIDEO_HINT = "mp4 / 1080P 及以上 / 帧率 ≥ 24 / 码率 ≥ 6Mbps / 竖版更有流量"
+
+# PDD_CONTENT_DECLARATION：**内容声明**选哪一项。
+#
+# 这是拼多多的**必选项**（发布页上带红星 `*`）：`anchorDeclarationType` 为空时，
+# 平台点「发布」**只弹一句警告、连请求都不发**（文案「请选择内容声明」）。
+# 首次真实发布两次都失败就是卡在这里——当时驱动没设它，而提示层类名（`TST_notice*`）
+# 又没被日志抓到，于是表现为"点了发布没回执"。
+# 可选值来自发布页初始化接口 `/api/backbone/video/publish/page/query` 的
+# `anchorDeclarationList`（2026-10-08 实测）：
+#     内容无需标注(11) / 含AI生成内容(1) / 含虚构演绎内容(5) /
+#     内容含营销信息(7) / 内容为转载(3) / 个人观点，仅供参考(8)
+# 默认选「内容无需标注」——和抖音「自主声明」、视频号「视频标注」的既有取舍一致：
+# 实拍素材不主动挂"含 AI 生成内容"的牌子；**成片确实含 AI 生成画面时**再改成
+# 「含AI生成内容」。文案由 AI 代写不算（平台这一项说的是内容本身）。
+PDD_CONTENT_DECLARATION = "内容无需标注"
+
+# PDD_UPLOAD_STALL_SECONDS / PDD_UPLOAD_RETRIES：**上传卡住的检测与自救**。
+#
+# 背景（2026-10-09 实测）：一批 22 条里有 3 条卡在"文件已选中、平台侧再没动静"——
+# 素材本身没问题（4MB / 10~25 秒），草稿箱里也没有，就是平台侧那次上传没响应；
+# 而当时的等待逻辑是**安静地等满 10 分钟**，界面上只有转圈，用户只能手动中断。
+#
+# 现在：超过 PDD_UPLOAD_STALL_SECONDS 秒没有任何进展（进度文案没变、视频卡片也没出来）
+# 就判定卡住 → 重新加载页面 + 重新选文件上传一次；再卡住就带明确原因快速失败。
+# 正常情况这条链路只要 10~15 秒，所以 120 秒的阈值有 10 倍余量。
+PDD_UPLOAD_STALL_SECONDS = int(_os.environ.get("SAU_PDD_UPLOAD_STALL") or 120)
+PDD_UPLOAD_RETRIES = int(_os.environ.get("SAU_PDD_UPLOAD_RETRIES") or 1)

@@ -102,6 +102,14 @@
           </el-tag>
         </div>
 
+        <!-- 平台风险提示。小红书这条是用户明确要求加在发布选项上的：
+             它的风控在几个平台里最严（对"模拟真人"本身就有治理规则），
+             工作台那条路是有头模式 + 逐字段人工确认，出问题的概率明显更低。 -->
+        <div v-if="PLATFORM_NOTICE[p.key]" class="platform-notice">
+          <span class="platform-notice-icon">⚠️</span>
+          <span>{{ PLATFORM_NOTICE[p.key] }}</span>
+        </div>
+
         <div v-if="selectedPlatforms.includes(p.key)" class="platform-body">
           <el-select
             v-model="platformAccounts[p.key]"
@@ -420,8 +428,20 @@ const uploading = ref(false)
 // 待发布项：每个素材一份文案
 const items = ref([])
 
+// 平台级提示语：发布中心里跟在平台名下面显示。
+// 目前只有小红书一条（用户要求）：它的风控最严，建议改走「小红书工作台」的有头模式。
+const PLATFORM_NOTICE = {
+  1: '小红书风控较严格，建议走工作台有头模式发布作品',
+}
+
 const selectedPlatforms = ref([])
-const platformAccounts = reactive({ 1: [], 2: [], 3: [], 4: [] })
+// 每个平台选中的账号。**从 PLATFORMS 派生，不要手写 1~4**：
+// 原来这里写死 `{ 1: [], 2: [], 3: [], 4: [] }`，加第 5 个平台（拼多多视频）时就漏了——
+// `platformAccounts[5]` 恒为 undefined，表现是"这个平台的下拉框永远空着、每次都要手选"，
+// 而且任何自动选账号的代码走到 `platformAccounts[key].length` 都会抛 TypeError 被静默吞掉。
+const platformAccounts = reactive(
+  Object.fromEntries(PLATFORMS.map((p) => [p.key, []]))
+)
 
 const isOriginal = ref(false)
 const isDraft = ref(false)
@@ -541,7 +561,18 @@ async function loadMaterials() {
 async function loadAccounts() {
   try {
     const res = await accountApi.getAccounts()
-    if (res.code === 200) accountStore.setAccounts(res.data || [])
+    if (res.code === 200) {
+      accountStore.setAccounts(res.data || [])
+      // 账号是异步来的：如果用户在加载完成**之前**就勾了平台，
+      // 那时 `accountsOf(key)` 还是空的，全选没填上。这里在账号到位后补一次，
+      // 只补"还没选过账号"的平台——已经选过（哪怕只选了一个）的保持原样。
+      selectedPlatforms.value.forEach((key) => {
+        const list = accountsOf(key)
+        if (list.length && !(platformAccounts[key] || []).length) {
+          platformAccounts[key] = list.map((a) => a.id)
+        }
+      })
+    }
   } catch (e) {
     /* 拦截器已提示 */
   }
@@ -662,9 +693,16 @@ async function uploadLocal(options) {
 function togglePlatform(key, checked) {
   if (checked) {
     if (!selectedPlatforms.value.includes(key)) selectedPlatforms.value.push(key)
-    // 只有该平台一个账号时自动选上，省一步点击
+    // 勾上平台就把该平台下的账号**全选**，省掉一次点击。
+    //
+    // 为什么改成"全选"而不是原来的"只有一个账号时才自动选"：多账号的人每次都得手动
+    // 再勾一遍，而这里的语义本来就是"这个平台我都要发"——真要挑账号，展开后取消掉
+    // 那几个即可（取消是显式动作，不会被这个默认值覆盖回来）。
+    // 只在用户还没选过（空）时填：已经选过的保持原样，别把人的选择冲掉。
     const list = accountsOf(key)
-    if (list.length === 1 && !platformAccounts[key].length) platformAccounts[key] = [list[0].id]
+    if (list.length && !(platformAccounts[key] || []).length) {
+      platformAccounts[key] = list.map((a) => a.id)
+    }
   } else {
     selectedPlatforms.value = selectedPlatforms.value.filter((k) => k !== key)
   }
@@ -1032,6 +1070,23 @@ onBeforeUnmount(stopPolling)
 .platform-name {
   font-weight: 600;
   font-size: 14px;
+}
+/* 平台风险提示：跟在平台名下面一行，克制一点，别把"没有账号"那种 tag 挤变形 */
+.platform-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: #fdf6ec;
+  border: 1px solid #faecd8;
+  color: #b88230;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.platform-notice-icon {
+  flex: 0 0 auto;
 }
 .platform-body {
   margin-top: 10px;

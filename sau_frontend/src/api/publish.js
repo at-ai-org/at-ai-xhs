@@ -3,12 +3,15 @@ import { http } from '@/utils/request'
 // 发布中心相关 API（at-ai-xhs 改造新增）
 // 后端路由前缀 /publish，见 sau_backend_publish.py
 
-/** 平台定义。前后端都按这套 key 对齐：1 小红书 / 2 视频号 / 3 抖音 / 4 快手 */
+/** 平台定义。前后端都按这套 key 对齐：1 小红书 / 2 视频号 / 3 抖音 / 4 快手 / 5 拼多多视频
+ *  拼多多这条只有「达人」身份（扫码），发布时不挂商品——达人挂品要先在拼多多后台
+ *  过「匹配度测试」，见 uploader/pdd_uploader/main.py。 */
 export const PLATFORMS = [
   { key: 1, name: '小红书' },
   { key: 2, name: '视频号' },
   { key: 3, name: '抖音' },
-  { key: 4, name: '快手' }
+  { key: 4, name: '快手' },
+  { key: 5, name: '拼多多视频' }
 ]
 
 export const platformName = (key) => PLATFORMS.find((p) => p.key === key)?.name || `平台${key}`

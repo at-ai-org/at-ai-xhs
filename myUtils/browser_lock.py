@@ -196,6 +196,33 @@ def browser_session(
         lock.release()
 
 
+@contextmanager
+def browser_slot(wait_timeout: float | None = None):
+    """只抢「整机并发名额」，**不碰账号锁**。
+
+    给"账号锁由调用链更里面那一层负责"的场景用。目前的实际用途是账号数据同步
+    （`myUtils/account_stats/sync.py`）：它把开浏览器这件事交给平台适配器，而适配器
+    自己会按"它真正要独占的那样东西"上锁——小红书 / 快手锁的是 cookie 文件（和发布任务
+    互斥），视频号锁的是持久化 profile 目录（和视频号发布会话互斥）。同步这一层如果再
+    按 cookie 文件锁一次，就会出现两把粒度不同的锁套在一起，而且视频号那边锁的根本
+    不是同一个东西，白锁。
+
+    但**并发名额必须在这一层抢**：定时任务会逐个账号同步，没有这个闸门就可能同时开出
+    一堆 chromium（每个几百 MB）。
+    """
+    timeout = LOCK_WAIT_TIMEOUT if wait_timeout is None else max(0.0, float(wait_timeout))
+    if not BROWSER_SLOTS.acquire(blocking=False):
+        if not BROWSER_SLOTS.acquire(timeout=timeout):
+            raise BrowserLockTimeout(
+                f"等一个并发名额（同时最多 {MAX_CONCURRENT_BROWSERS} 个浏览器在跑）超过 "
+                f"{_wait_text(timeout)}，已放弃。多半是有任务卡死占着名额不放——重启后端可以立即回收。"
+            )
+    try:
+        yield
+    finally:
+        BROWSER_SLOTS.release()
+
+
 __all__ = [
     "MAX_CONCURRENT_BROWSERS",
     "BROWSER_SLOTS",
@@ -206,4 +233,5 @@ __all__ = [
     "account_key",
     "account_lock",
     "browser_session",
+    "browser_slot",
 ]

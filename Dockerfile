@@ -96,7 +96,7 @@ COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 浏览器：代码里**两个驱动都在用**，都要装，且共用同一个 PLAYWRIGHT_BROWSERS_PATH：
-#   * patchright —— 四个平台（小红书/视频号/抖音/快手）的发布路径，
+#   * patchright —— 五个平台（小红书/视频号/抖音/快手/拼多多视频）的发布路径，
 #                   其中 8 处写的是 `channel="chromium"`（完整 Chromium / 新 headless），
 #                   只装 headless-shell 时这些启动会报找不到可执行文件；
 #   * playwright —— myUtils/auth.py、myUtils/login.py 的扫码登录 / cookie 校验路径，

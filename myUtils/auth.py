@@ -5,7 +5,7 @@ import os
 from playwright.async_api import async_playwright
 from xhs import XhsClient
 
-from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
+from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, PDD_HEADLESS
 from utils.base_social_media import set_init_script
 from utils.log import kuaishou_logger, douyin_logger
 from pathlib import Path
@@ -123,6 +123,58 @@ async def cookie_auth_xhs(account_file, save_state: bool = False):
             return True
 
 
+async def cookie_auth_pdd(account_file, save_state: bool = False):
+    """拼多多视频（达人）登录态校验。
+
+    走 uploader 那条统一的校验实现（`uploader/pdd_uploader/main.py::cookie_auth`）：
+    判据是"打开发布页有没有被踹到 /login"，比等某个 DOM 元素可靠——后者在页面慢的
+    时候会误报失效，把人骗去重新扫码（抖音那条老路踩过）。
+
+    和快手/抖音一样支持 `save_state`：拼多多的登录态同样是**服务端会话**，
+    一次访问之后服务端可能轮换票据，续期时必须把新票写回，否则"校验一次反而更快掉线"。
+    """
+    from uploader.pdd_uploader.main import cookie_auth as _pdd_cookie_auth
+
+    valid = await _pdd_cookie_auth(Path(account_file))
+    if valid:
+        # 校验本身是用一次性 context 跑的，回写要靠再开一次。
+        # 代价是多次浏览器启动，所以只在明确要求续期时做（session_renew 会传 True）。
+        if save_state:
+            await _persist_pdd_state(Path(account_file))
+    return valid
+
+
+async def _persist_pdd_state(account_file) -> None:
+    """带着账号 cookie 打开发布页并把浏览器里的最新 cookie 回写账号文件。
+
+    为什么不能省：拼多多的会话票据在服务端轮换，本地文件里那条旧票会被作废。
+    回写只在**校验通过后**发生（见 `_persist_state` 的说明），失败只记日志。
+    """
+    async with async_playwright() as playwright:
+        # 用拼多多自己的无头开关（PDD_HEADLESS / SAU_PDD_HEADLESS），别和 LOCAL_CHROME_HEADLESS 分叉：
+        # 首次接入时用户很可能会把拼多多切成有头来看页面，回写这一步也该跟着有头，
+        # 否则"同一账号两种设备指纹"，正是视频号那条链路踩过的坑。
+        browser = await playwright.chromium.launch(headless=PDD_HEADLESS)
+        try:
+            context = await browser.new_context(storage_state=str(account_file))
+            context = await set_init_script(context)
+            page = await context.new_page()
+            await page.goto(
+                "https://live.pinduoduo.com/n-creator/video/home",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            await page.wait_for_timeout(3000)
+            if "/login" not in page.url:
+                await _persist_state(context, account_file, True)
+            else:
+                print("⚠️ 回写拼多多 cookie 时发现已跳到登录页，本次不回写")
+        except Exception as exc:  # noqa: BLE001 —— 回写失败不该让"校验通过"这个结论反转
+            print(f"⚠️ 回写拼多多 cookie 异常（忽略）: {exc}")
+        finally:
+            await browser.close()
+
+
 async def check_cookie(type, file_path, save_state: bool = False):
     """校验登录态；`save_state=True` 时顺带把服务端轮换下来的新票据写回账号文件。
 
@@ -144,6 +196,9 @@ async def check_cookie(type, file_path, save_state: bool = False):
         # 快手
         case 4:
             return await cookie_auth_ks(Path(BASE_DIR / "cookiesFile" / file_path), save_state=save_state)
+        # 拼多多视频
+        case 5:
+            return await cookie_auth_pdd(Path(BASE_DIR / "cookiesFile" / file_path), save_state=save_state)
         case _:
             return False
 

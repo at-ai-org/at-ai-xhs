@@ -263,7 +263,10 @@ class RunOnceTest(unittest.TestCase):
             3: {"status": session_renew.STATUS_BUSY, "message": "忙"},
         }
 
-        def fake_renew(account):
+        seen_kwargs = []
+
+        def fake_renew(account, **kwargs):
+            seen_kwargs.append(kwargs)
             return {"id": account["id"], "name": account["name"], "platform": account["platform"],
                     **results[account["id"]]}
 
@@ -274,6 +277,8 @@ class RunOnceTest(unittest.TestCase):
 
         self.assertEqual((run["total"], run["ok"], run["invalid"], run["busy"], run["error"]), (3, 1, 1, 1, 0))
         self.assertEqual(len(run["accounts"]), 3)
+        # 默认必须顺带同步账号数据（2026-10 起这一轮续期兼任数据同步）
+        self.assertTrue(all(kw.get("with_stats") is True for kw in seen_kwargs))
 
     def test_only_ids_limits_the_run(self):
         accounts = [
@@ -282,7 +287,7 @@ class RunOnceTest(unittest.TestCase):
         ]
         renewed = []
 
-        def fake_renew(account):
+        def fake_renew(account, **kwargs):
             renewed.append(account["id"])
             return {
                 "id": account["id"],

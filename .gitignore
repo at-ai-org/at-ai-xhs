@@ -187,5 +187,12 @@ videos/
 # uploader/ks_uploader/main.py 的 _dump_page_debug()
 ks_debug/
 
+# 拼多多发布每一步的现场（HTML + 截图）+ 自动生成的封面帧。运行时产物，见
+# uploader/pdd_uploader/main.py 的 _dump()
+pdd_debug/
+
 # 登录过程中生成的临时二维码图片
 cookiesFile/*_login_qrcode_*.png
+
+# 账号同步时落到本地的头像（运行时产物，见 myUtils/account_stats/avatar.py）
+avatars/

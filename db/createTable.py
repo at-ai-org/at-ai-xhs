@@ -42,7 +42,7 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS publish_records (
     job_id         TEXT,      -- 一次批量提交对应一个批次（工作台单条发布为空）
     task_id        TEXT,      -- 一个「素材 × 账号」任务
     source         TEXT,      -- publish_center / xhs_workbench
-    platform       INTEGER,   -- 1 小红书 2 视频号 3 抖音 4 快手
+    platform       INTEGER,   -- 1 小红书 2 视频号 3 抖音 4 快手 5 拼多多视频
     platform_name  TEXT,
     account_id     INTEGER,
     account_name   TEXT,
@@ -99,6 +99,25 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS material_bgm (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 ''')
+
+
+# 账号数据缓存（at-ai-xhs 改造新增）
+# 「账号管理」→「详情」抓回来的粉丝 / 互动 / 作品数据。一个账号一行（**快照，不是时序库**），
+# 主键就是 user_info.id；要重抓直接覆盖。看趋势靠平台返回的逐日序列，不靠这张表攒历史。
+# 30 分钟的 TTL 写在 myUtils/account_stats/cache.py 里。
+# 后端启动时（sau_backend.py 的 account_stats_cache.ensure_tables）也会建，老库不用重跑本脚本。
+cursor.execute('''CREATE TABLE IF NOT EXISTS account_stats (
+    account_id   INTEGER PRIMARY KEY,
+    platform_no  INTEGER,
+    account_name TEXT,
+    stats        TEXT,        -- JSON：规范化后的整份账号数据
+    fetched_at   TEXT,        -- 本地时间字符串，界面上的「X 分钟前更新」靠它
+    updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+''')
+cursor.execute(
+    'CREATE INDEX IF NOT EXISTS idx_account_stats_platform ON account_stats(platform_no)'
+)
 
 
 # 提交更改

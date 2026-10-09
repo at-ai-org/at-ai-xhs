@@ -61,3 +61,5 @@ youtube_logger = create_logger('youtube', 'logs/youtube.log')
 alipay_logger = create_logger('alipay', 'logs/alipay.log')
 weibo_logger = create_logger('weibo', 'logs/weibo.log')
 hupu_logger = create_logger('hupu', 'logs/hupu.log')
+# 拼多多视频（多多视频）——at-ai-xhs 改造新增
+pdd_logger = create_logger('pdd', 'logs/pdd.log')

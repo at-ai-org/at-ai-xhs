@@ -38,6 +38,17 @@
   * 整机并发名额由 `browser_session` 统一限流，账号是**顺序**续期的（一次一个），
     免得 0 点时同时开出一堆浏览器把机器拖垮。
 
+顺带同步账号数据（2026-10 新增）
+--------------------------------
+一轮续期里，每个账号**续期成功之后**会顺手把它的粉丝 / 互动 / 作品数据也抓一遍，
+覆盖本地库（`account_stats` 表），详情页随之就是最新的。理由和做法见 `renew_account()`
+的注释；干活的函数在 `myUtils/account_stats/sync.py`，和「同步」按钮、以及"账号刚加进来"
+那一次走的是**同一个** `sync_account()`。
+
+续期成功但同步失败是允许出现的组合（比如视频号那个账号在视频号侧已掉线，而其它平台的
+校验口径仍认为它有效），所以结果里把两者分开统计：`ok/invalid/busy/error` 是续期的，
+`stats_ok/stats_failed` 才是数据同步的。界面上跟着分开显示。
+
 状态只放在内存里
 ----------------
 `_last_run` / `_done_slots` 都不落盘。重启后"今天已经跑过的点"不记得了，但也不会重复跑
@@ -55,6 +66,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from conf import BASE_DIR
+from myUtils.account_stats.sync import sync_account
 from myUtils.app_settings import get_session_renew_config
 from myUtils.auth import check_cookie
 from myUtils.browser_lock import BrowserLockTimeout, browser_session
@@ -69,7 +81,7 @@ BUSY_RETRY_DELAY = float(os.environ.get("SAU_SESSION_RENEW_RETRY_DELAY", "600") 
 BUSY_RETRY_LIMIT = 2
 
 #: 平台编号 → 名字（user_info.type，和前端 connectSSE 的映射一致）。
-PLATFORM_NAMES = {1: "小红书", 2: "视频号", 3: "抖音", 4: "快手"}
+PLATFORM_NAMES = {1: "小红书", 2: "视频号", 3: "抖音", 4: "快手", 5: "拼多多视频"}
 
 #: 续期结果的四种结论。
 #:   ok      = 会话有效，续期成功
@@ -179,8 +191,20 @@ def next_run_at(config: dict, now: datetime | None = None) -> datetime | None:
 # --------------------------------------------------------------------------- #
 # 一个账号的续期
 # --------------------------------------------------------------------------- #
-def renew_account(account: dict) -> dict:
-    """给一个账号续期一次，返回结果行（不抛异常）。"""
+def renew_account(account: dict, *, with_stats: bool = True) -> dict:
+    """给一个账号续期一次（顺带同步账号数据），返回结果行（不抛异常）。
+
+    顺序是**先续期、后同步**，而且同步只在续期成功时才做：
+
+    * 续期失败（会话失效）时，平台侧的数据接口本来也会拒，同步只会白白开一次浏览器，
+      还把一条注定失败的记录写进日志；
+    * 续期成功时，**服务端刚轮换下来的新票据已经写回 cookie 文件**了，紧接着同步
+      用的就是这份新票据——比反过来（先同步、后续期）少一次掉线风险。
+
+    为什么要在这里顺带同步：续期本来就要给每个账号开一次浏览器进创作者后台，
+    数据同步是同一件事的延伸（都要"带着这个账号的登录态去平台读一次"）。
+    分成两个定时任务就变成一天开两轮浏览器，还多一套调度。
+    """
     file_name = account.get("file_path") or ""
     account_path = COOKIE_DIR / file_name
     base = {
@@ -201,20 +225,37 @@ def renew_account(account: dict) -> dict:
     except Exception as exc:
         return {**base, "status": STATUS_ERROR, "message": f"续期出错: {exc}"}
 
-    if ok:
-        return {**base, "status": STATUS_OK, "message": "会话有效，已续期"}
+    if not ok:
+        _mark_invalid(account["id"])
+        return {**base, "status": STATUS_INVALID, "message": "会话已失效，需要重新扫码授权"}
 
-    _mark_invalid(account["id"])
-    return {**base, "status": STATUS_INVALID, "message": "会话已失效，需要重新扫码授权"}
+    row = {**base, "status": STATUS_OK, "message": "会话有效，已续期"}
+
+    if with_stats:
+        # 刻意**在 browser_session 之外**做：续期那把锁已经还回去了，同步那一步自己
+        # 会按"适配器真正要独占的东西"上锁（小红书/快手是 cookie 文件、视频号是 profile）。
+        # 套在续期的锁里面会出现两把粒度不同的锁嵌套，还可能把发布任务堵在中间。
+        try:
+            row["stats"] = sync_account(account)
+        except Exception as exc:  # 同步出问题不该让"续期成功"这个结论反转
+            row["stats"] = {"status": STATUS_ERROR, "message": f"数据同步出错: {exc}"}
+
+    return row
 
 
 # --------------------------------------------------------------------------- #
 # 一轮续期
 # --------------------------------------------------------------------------- #
-def run_once(reason: str = "手动", only_ids: Iterable[int] | None = None) -> dict:
+def run_once(
+    reason: str = "手动",
+    only_ids: Iterable[int] | None = None,
+    *,
+    with_stats: bool = True,
+) -> dict:
     """跑一轮续期（**同步**，顺序处理账号）。定时线程和排查/测试都调它。
 
     `only_ids` 只跑指定账号（被占用之后的重试用它，不用把整张表再跑一遍）。
+    `with_stats=False` 只续期、不同步数据（排查时想快一点就用它）。
     """
     accounts = list_accounts()
     if only_ids is not None:
@@ -226,7 +267,7 @@ def run_once(reason: str = "手动", only_ids: Iterable[int] | None = None) -> d
 
     rows: list[dict] = []
     for account in accounts:
-        row = renew_account(account)
+        row = renew_account(account, with_stats=with_stats)
         rows.append(row)
         icon = {
             STATUS_OK: "✅",
@@ -237,9 +278,30 @@ def run_once(reason: str = "手动", only_ids: Iterable[int] | None = None) -> d
         # 用 get 取名字：一个账号的结果行缺字段不该把整轮续期打断（日志比结论次要）
         label = f"{row.get('platform') or '?'}·{row.get('name') or row.get('id') or '?'}"
         print(f"  {icon} {label}：{row.get('message') or ''}")
+        stats_row = row.get("stats") or {}
+        if stats_row:
+            stats_icon = {
+                STATUS_OK: "📊",
+                STATUS_INVALID: "•",
+                STATUS_BUSY: "🕐",
+                STATUS_ERROR: "⚠️",
+            }.get(stats_row.get("status"), "•")
+            print(f"      {stats_icon} 数据同步：{stats_row.get('message') or ''}")
 
     counts = {key: sum(1 for r in rows if r["status"] == key) for key in
               (STATUS_OK, STATUS_INVALID, STATUS_BUSY, STATUS_ERROR)}
+    # 数据同步的统计单独算一份，而且**三种情况都要数**：
+    #   * ok      = 真的同步成功了
+    #   * invalid = 平台侧拿不到（未登录 / 不支持）——这不是"失败"，用户扫码就能解决
+    #   * failed  = busy + error，才是真的需要去查的
+    # 只报 ok 和 failed 的话，视频号那种 invalid 会掉在两个数字之外，
+    # 出现"4 个账号，但 3 + 0 ≠ 4"的账，看日志的人会以为自己数错了（实测踩过）。
+    sync_counts = {key: 0 for key in (STATUS_OK, STATUS_INVALID, STATUS_BUSY, STATUS_ERROR)}
+    for row in rows:
+        status = (row.get("stats") or {}).get("status")
+        if status in sync_counts:
+            sync_counts[status] += 1
+
     result = {
         "reason": reason,
         "started_at": started.strftime("%Y-%m-%d %H:%M:%S"),
@@ -249,11 +311,16 @@ def run_once(reason: str = "手动", only_ids: Iterable[int] | None = None) -> d
         "invalid": counts[STATUS_INVALID],
         "busy": counts[STATUS_BUSY],
         "error": counts[STATUS_ERROR],
+        "stats_ok": sync_counts[STATUS_OK],
+        "stats_invalid": sync_counts[STATUS_INVALID],
+        "stats_failed": sync_counts[STATUS_ERROR] + sync_counts[STATUS_BUSY],
         "accounts": rows,
     }
     print(
         f"🔄 会话续期[{reason}]结束：有效 {result['ok']}、失效 {result['invalid']}、"
-        f"跳过 {result['busy']}、出错 {result['error']}\n"
+        f"跳过 {result['busy']}、出错 {result['error']}"
+        f"｜数据同步成功 {result['stats_ok']}、拿不到 {result['stats_invalid']}、"
+        f"失败 {result['stats_failed']}\n"
     )
     return result
 
@@ -399,6 +466,7 @@ __all__ = [
     "plan_due_slots",
     "renew_account",
     "run_once",
+    "sync_account",
     "start",
     "status",
     "tick",

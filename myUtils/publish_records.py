@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS publish_records (
     job_id         TEXT,     -- 一次批量提交对应一个批次（工作台单条发布为空）
     task_id        TEXT,     -- 一个「素材 × 账号」任务
     source         TEXT,     -- publish_center / xhs_workbench
-    platform       INTEGER,  -- 1 小红书 2 视频号 3 抖音 4 快手
+    platform       INTEGER,  -- 1 小红书 2 视频号 3 抖音 4 快手 5 拼多多视频
     platform_name  TEXT,
     account_id     INTEGER,
     account_name   TEXT,

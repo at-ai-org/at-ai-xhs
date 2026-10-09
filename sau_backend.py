@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify, Response, render_template, send_from_
 from werkzeug.utils import secure_filename
 from conf import BASE_DIR
 from myUtils import publish_records
-from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen
+from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen, get_pdd_cookie
 from myUtils.postVideo import post_video_tencent, post_video_DouYin, post_video_ks, post_video_xhs
 # at-ai-xhs 改造新增：小红书网页操作接口（扫码登录 / 契约自检 / 合集列表 / 发布）
 # all_material_copies：素材 AI 文案表，/getFiles 用它标出每条素材"有没有 AI 文案"
@@ -42,6 +42,10 @@ from myUtils import web_auth
 # 都会顺手开一个后台调度器。
 from myUtils import session_renew
 from sau_backend_session import session_bp
+# at-ai-xhs 改造新增：账号数据（粉丝 / 互动）详情（/account-stats）。
+# 抓取本体在 myUtils/account_stats/（四个平台各一个适配器），缓存落 db 的 account_stats 表。
+from sau_backend_stats import account_stats_bp
+from myUtils.account_stats import cache as account_stats_cache
 
 active_queues = {}
 app = Flask(__name__)
@@ -63,8 +67,16 @@ app.register_blueprint(music_bp)
 # 跟小红书无关，挂在 /xhs 下会让人以为只续小红书。
 app.register_blueprint(session_bp)
 
+# at-ai-xhs 改造新增：注册账号数据详情蓝图（/account-stats）。
+# 同样刻意**不放在 `/xhs` 前缀下**：详情弹窗对四个平台一视同仁。
+app.register_blueprint(account_stats_bp)
+
 # at-ai-xhs 改造新增：背景音乐那两张表兜底建一遍（老库不会重跑 db/createTable.py）
 ensure_music_tables()
+
+# at-ai-xhs 改造新增：账号数据缓存表兜底建一遍（同一个理由）。
+# 不建的话，详情弹窗第一次点击会因为"没有这张表"而拿不到缓存、每次都去开浏览器。
+account_stats_cache.ensure_tables()
 
 # at-ai-xhs 改造新增：启用登录认证。
 # 必须在所有蓝图注册完之后调用——守卫是按"拿到的是哪个端点"来判断放行的，
@@ -514,6 +526,11 @@ def delete_account():
             cursor.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
             conn.commit()
 
+        # at-ai-xhs 改造新增：把账号数据缓存一起清掉。
+        # 不清的话，万一 id 被复用（手工改过库 / 导入过别人的库），新账号一进来就会
+        # 显示上一个账号的粉丝数——这种错很难被发现，所以这里主动删干净。
+        account_stats_cache.delete(account_id)
+
         return jsonify({
             "code": 200,
             "msg": "account deleted successfully",
@@ -531,7 +548,7 @@ def delete_account():
 # SSE 登录接口
 @app.route('/login')
 def login():
-    # 1 小红书 2 视频号 3 抖音 4 快手
+    # 1 小红书 2 视频号 3 抖音 4 快手 5 拼多多视频
     type = request.args.get('type')
     # 账号名
     id = request.args.get('id')
@@ -871,6 +888,13 @@ def _run_login_task(type, id, status_queue):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(get_ks_cookie(id,status_queue))
+            loop.close()
+        case '5':
+            # 拼多多视频（多多视频）——「达人」扫码。商家身份的登录方式不一样
+            # （账号密码 / 短信验证码），本项目不做，见 get_pdd_cookie 的说明。
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(get_pdd_cookie(id,status_queue))
             loop.close()
         case _:
             print(f"⚠️ 未知的登录类型: {type!r}")

@@ -102,6 +102,11 @@ from uploader.ks_uploader.main import (
     KUAISHOU_PUBLISH_STRATEGY_SCHEDULED,
     KSVideo,
 )
+from uploader.pdd_uploader.main import (
+    PDD_PUBLISH_STRATEGY_IMMEDIATE,
+    PDD_PUBLISH_STRATEGY_SCHEDULED,
+    PddVideo,
+)
 from uploader.tencent_uploader.main import (
     TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
     TENCENT_PUBLISH_STRATEGY_SCHEDULED,
@@ -125,6 +130,9 @@ PLATFORMS: dict[int, dict] = {
     2: {"key": 2, "name": "视频号", "business": "tencent"},
     3: {"key": 3, "name": "抖音", "business": "douyin"},
     4: {"key": 4, "name": "快手", "business": "kuaishou"},
+    # 5 = 拼多多视频（多多视频）。账号身份固定是「达人」——拼多多后台三种身份
+    # （商家/达人/机构）登录方式各不相同，只有达人是扫码，见 myUtils/login.py。
+    5: {"key": 5, "name": "拼多多视频", "business": "pdd"},
 }
 
 # (立即发布, 定时发布) 两个策略常量。每个平台都得显式传：
@@ -135,6 +143,7 @@ PUBLISH_STRATEGY: dict[int, tuple[str, str]] = {
     2: (TENCENT_PUBLISH_STRATEGY_IMMEDIATE, TENCENT_PUBLISH_STRATEGY_SCHEDULED),
     3: (DOUYIN_PUBLISH_STRATEGY_IMMEDIATE, DOUYIN_PUBLISH_STRATEGY_SCHEDULED),
     4: (KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE, KUAISHOU_PUBLISH_STRATEGY_SCHEDULED),
+    5: (PDD_PUBLISH_STRATEGY_IMMEDIATE, PDD_PUBLISH_STRATEGY_SCHEDULED),
 }
 
 # --------------------------------------------------------------------------- #
@@ -620,6 +629,25 @@ def _invoke_uploader(task: dict) -> None:
             desc=task["desc"],
         )
         _run_uploader_async(app.main(), task_id, cancel_event)
+        return
+
+    if platform == 5:
+        # 拼多多视频（达人）。默认**不挂商品**：达人挂商品要先在拼多多后台过
+        # 「匹配度测试」，本版先把发布这件事跑通，挂品留到后面单独做。
+        # 封面走发布中心已有的 `thumbnail` 选项（抖音也是这么用的）。
+        app = PddVideo(
+            task["title"],
+            file_path,
+            task["tags"],
+            publish_at,
+            account_file,
+            publish_strategy=strategy,
+            desc=task["desc"],
+            thumbnail_path=options.get("thumbnail") or None,
+        )
+        _attach_app(task["task_id"], app)
+        _run_uploader_async(app.main(), task_id, cancel_event)
+        task["steps"] = _json_safe(getattr(app, "step_results", []) or [])
         return
 
     raise RuntimeError(f"不支持的平台类型: {platform}")

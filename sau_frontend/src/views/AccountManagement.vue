@@ -33,7 +33,7 @@
               <el-table :data="filteredAccounts" style="width: 100%">
                 <el-table-column label="头像" width="80">
                   <template #default="scope">
-                    <el-avatar :src="getDefaultAvatar(scope.row.name)" :size="40" />
+                    <el-avatar :src="avatarSrc(scope.row)" :size="40" @error="() => onAvatarError(scope.row)" />
                   </template>
                 </el-table-column>
                 <el-table-column prop="name" label="名称" width="180" />
@@ -76,6 +76,10 @@
                     >
                       重新扫码
                     </el-button>
+                    <!-- 「详情」：做进操作栏而不是新加表格列——粉丝/关注/获赞/作品数四个指标
+                         塞进表格会让表宽到要横向滚动，而用户想看的是"这个账号最近怎么样"，
+                         那需要一屏，不是一列。组件内部同时管着弹窗，所以这里只是一行。 -->
+                    <AccountStatsButton :account="scope.row" />
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -118,7 +122,7 @@
               <el-table :data="filteredKuaishouAccounts" style="width: 100%">
                 <el-table-column label="头像" width="80">
                   <template #default="scope">
-                    <el-avatar :src="getDefaultAvatar(scope.row.name)" :size="40" />
+                    <el-avatar :src="avatarSrc(scope.row)" :size="40" @error="() => onAvatarError(scope.row)" />
                   </template>
                 </el-table-column>
                 <el-table-column prop="name" label="名称" width="180" />
@@ -161,6 +165,10 @@
                     >
                       重新扫码
                     </el-button>
+                    <!-- 「详情」：做进操作栏而不是新加表格列——粉丝/关注/获赞/作品数四个指标
+                         塞进表格会让表宽到要横向滚动，而用户想看的是"这个账号最近怎么样"，
+                         那需要一屏，不是一列。组件内部同时管着弹窗，所以这里只是一行。 -->
+                    <AccountStatsButton :account="scope.row" />
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -172,6 +180,94 @@
             
             <div v-else class="empty-data">
               <el-empty description="暂无快手账号数据" />
+            </div>
+          </div>
+        </el-tab-pane>
+        <el-tab-pane label="拼多多视频" name="pdd">
+          <div class="account-list-container">
+            <div class="account-search">
+              <el-input
+                v-model="searchKeyword"
+                placeholder="输入名称或账号搜索"
+                prefix-icon="Search"
+                clearable
+                @clear="handleSearch"
+                @input="handleSearch"
+              />
+              <div class="action-buttons">
+                <el-button type="primary" @click="handleAddAccount">添加账号</el-button>
+                <!-- 定时续期开关：到点后由后端给下面这些账号逐个续一次会话，避免悄悄掉线。
+                     组件自带状态（两页共享一份），设置页里也能开关同一件事。 -->
+                <SessionRenewToggle />
+                <el-button type="info" @click="fetchAccounts" :loading="false">
+                  <el-icon :class="{ 'is-loading': appStore.isAccountRefreshing }"><Refresh /></el-icon>
+                  <span v-if="appStore.isAccountRefreshing">刷新中</span>
+                </el-button>
+              </div>
+            </div>
+            
+            <div v-if="filteredPddAccounts.length > 0" class="account-list">
+              <el-table :data="filteredPddAccounts" style="width: 100%">
+                <el-table-column label="头像" width="80">
+                  <template #default="scope">
+                    <el-avatar :src="avatarSrc(scope.row)" :size="40" @error="() => onAvatarError(scope.row)" />
+                  </template>
+                </el-table-column>
+                <el-table-column prop="name" label="名称" width="180" />
+                <el-table-column prop="platform" label="平台">
+                  <template #default="scope">
+                    <el-tag
+                      :type="getPlatformTagType(scope.row.platform)"
+                      effect="plain"
+                    >
+                      {{ scope.row.platform }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column prop="status" label="状态">
+                  <template #default="scope">
+                    <el-tag
+                      :type="getStatusTagType(scope.row.status)"
+                      effect="plain"
+                      :class="{'clickable-status': isStatusClickable(scope.row.status)}"
+                      @click="handleStatusClick(scope.row)"
+                    >
+                      <el-icon :class="scope.row.status === '验证中' ? 'is-loading' : ''" v-if="scope.row.status === '验证中'">
+                        <Loading />
+                      </el-icon>
+                      {{ scope.row.status }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="操作">
+                  <template #default="scope">
+                    <!-- 异常账号的补救入口：不用先去点那个红色状态标签，这里直接重新授权一次。
+                         只在异常时出现——正常账号没有重新扫码的必要，按钮常驻反而会让人误点，
+                         而重新扫码会把当前登录态顶掉。 -->
+                    <el-button
+                      v-if="needsRelogin(scope.row.status)"
+                      size="small"
+                      type="warning"
+                      :icon="Refresh"
+                      @click="handleReLogin(scope.row)"
+                    >
+                      重新扫码
+                    </el-button>
+                    <!-- 「详情」：做进操作栏而不是新加表格列——粉丝/关注/获赞/作品数四个指标
+                         塞进表格会让表宽到要横向滚动，而用户想看的是"这个账号最近怎么样"，
+                         那需要一屏，不是一列。组件内部同时管着弹窗，所以这里只是一行。 -->
+                    <AccountStatsButton :account="scope.row" />
+                    <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
+                    <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
+                    <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
+                    <el-button size="small" type="danger" @click="handleDelete(scope.row)">删除</el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </div>
+            
+            <div v-else class="empty-data">
+              <el-empty description="暂无拼多多视频账号数据" />
             </div>
           </div>
         </el-tab-pane>
@@ -203,7 +299,7 @@
               <el-table :data="filteredDouyinAccounts" style="width: 100%">
                 <el-table-column label="头像" width="80">
                   <template #default="scope">
-                    <el-avatar :src="getDefaultAvatar(scope.row.name)" :size="40" />
+                    <el-avatar :src="avatarSrc(scope.row)" :size="40" @error="() => onAvatarError(scope.row)" />
                   </template>
                 </el-table-column>
                 <el-table-column prop="name" label="名称" width="180" />
@@ -246,6 +342,10 @@
                     >
                       重新扫码
                     </el-button>
+                    <!-- 「详情」：做进操作栏而不是新加表格列——粉丝/关注/获赞/作品数四个指标
+                         塞进表格会让表宽到要横向滚动，而用户想看的是"这个账号最近怎么样"，
+                         那需要一屏，不是一列。组件内部同时管着弹窗，所以这里只是一行。 -->
+                    <AccountStatsButton :account="scope.row" />
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -288,7 +388,7 @@
               <el-table :data="filteredChannelsAccounts" style="width: 100%">
                 <el-table-column label="头像" width="80">
                   <template #default="scope">
-                    <el-avatar :src="getDefaultAvatar(scope.row.name)" :size="40" />
+                    <el-avatar :src="avatarSrc(scope.row)" :size="40" @error="() => onAvatarError(scope.row)" />
                   </template>
                 </el-table-column>
                 <el-table-column prop="name" label="名称" width="180" />
@@ -331,6 +431,10 @@
                     >
                       重新扫码
                     </el-button>
+                    <!-- 「详情」：做进操作栏而不是新加表格列——粉丝/关注/获赞/作品数四个指标
+                         塞进表格会让表宽到要横向滚动，而用户想看的是"这个账号最近怎么样"，
+                         那需要一屏，不是一列。组件内部同时管着弹窗，所以这里只是一行。 -->
+                    <AccountStatsButton :account="scope.row" />
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -373,7 +477,7 @@
               <el-table :data="filteredXiaohongshuAccounts" style="width: 100%">
                 <el-table-column label="头像" width="80">
                   <template #default="scope">
-                    <el-avatar :src="getDefaultAvatar(scope.row.name)" :size="40" />
+                    <el-avatar :src="avatarSrc(scope.row)" :size="40" @error="() => onAvatarError(scope.row)" />
                   </template>
                 </el-table-column>
                 <el-table-column prop="name" label="名称" width="180" />
@@ -416,6 +520,10 @@
                     >
                       重新扫码
                     </el-button>
+                    <!-- 「详情」：做进操作栏而不是新加表格列——粉丝/关注/获赞/作品数四个指标
+                         塞进表格会让表宽到要横向滚动，而用户想看的是"这个账号最近怎么样"，
+                         那需要一屏，不是一列。组件内部同时管着弹窗，所以这里只是一行。 -->
+                    <AccountStatsButton :account="scope.row" />
                     <el-button size="small" @click="handleEdit(scope.row)">编辑</el-button>
                     <el-button size="small" type="primary" :icon="Download" @click="handleDownloadCookie(scope.row)">下载Cookie</el-button>
                     <el-button size="small" type="info" :icon="Upload" @click="handleUploadCookie(scope.row)">上传Cookie</el-button>
@@ -451,11 +559,25 @@
             :disabled="dialogType === 'edit' || sseConnecting"
           >
             <el-option label="快手" value="快手" />
+            <el-option label="拼多多视频" value="拼多多视频" />
             <el-option label="抖音" value="抖音" />
             <el-option label="视频号" value="视频号" />
             <el-option label="小红书" value="小红书" />
           </el-select>
         </el-form-item>
+        <!-- 拼多多视频的身份说明：它一套后台有三种身份，登录方式各不相同，而本工具只做达人。
+             不写清楚的话，商家号主会拿商家账号去扫这个码，然后卡在"扫了没反应"。 -->
+        <el-alert
+          v-if="accountForm.platform === '拼多多视频'"
+          type="info"
+          :closable="false"
+          show-icon
+          class="platform-hint"
+        >
+          <template #title>
+            拼多多视频走「达人」身份扫码（拼多多后台的商家 / 机构身份登录方式不同，本工具不支持）
+          </template>
+        </el-alert>
         <el-form-item label="名称" prop="name">
           <el-input 
             v-model="accountForm.name" 
@@ -524,6 +646,9 @@ import { withToken } from '@/utils/session'
 // 「定时续期」开关（放在「添加账号」旁边）。状态与「设置」页共享，
 // 见 composables/useSessionRenew.js 里关于"为什么不做成 5 份各自的状态"的说明。
 import SessionRenewToggle from '@/components/SessionRenewToggle.vue'
+// 「详情」按钮 + 账号数据弹窗（粉丝 / 互动 / 作品）。抽成组件是因为本页五个 tab
+// 各有一张自己的账号表，写五遍必然改一处漏四处。
+import AccountStatsButton from '@/components/AccountStatsButton.vue'
 
 // 获取账号状态管理
 const accountStore = useAccountStore()
@@ -548,6 +673,7 @@ const fetchAccountsQuick = async () => {
         return updatedAccount;
       });
       accountStore.setAccounts(accountsWithPendingStatus);
+      resetAvatarCache();
     }
   } catch (error) {
     console.error('快速获取账号数据失败:', error)
@@ -564,6 +690,8 @@ const fetchAccounts = async () => {
     const res = await accountApi.getValidAccounts()
     if (res.code === 200 && res.data) {
       accountStore.setAccounts(res.data)
+      // 刷新一次就给所有账号一次机会：刚同步到头像的账号不该因为之前那次 404 一直显示文字头像
+      resetAvatarCache()
       ElMessage.success('账号数据获取成功')
       // 标记为已访问
       if (appStore.isFirstTimeAccountManagement) {
@@ -612,7 +740,10 @@ const getPlatformTagType = (platform) => {
     '快手': 'success',
     '抖音': 'danger',
     '视频号': 'warning',
-    '小红书': 'info'
+    '小红书': 'info',
+    // 拼多多用主色（primary 之外 Element Plus 没有第六种语义色，danger/success
+    // 都被占了，'primary' 在这里是合法的 tag type，视觉上也不会和别的平台撞色）
+    '拼多多视频': 'primary'
   }
   return typeMap[platform] || 'info'
 }
@@ -669,6 +800,10 @@ const filteredChannelsAccounts = computed(() => {
 
 const filteredXiaohongshuAccounts = computed(() => {
   return filteredAccounts.value.filter(account => account.platform === '小红书')
+})
+
+const filteredPddAccounts = computed(() => {
+  return filteredAccounts.value.filter(account => account.platform === '拼多多视频')
 })
 
 // 搜索处理
@@ -860,9 +995,35 @@ const handleReLogin = (row) => {
 
 // 获取默认头像
 const getDefaultAvatar = (name) => {
-  // 使用简单的默认头像，可以基于用户名生成不同的颜色
+  // 兜底头像：用第三方文字头像服务按名字生成一张（本地没有同步到头像时用它）
   return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`
 }
+
+// 同步过详情的账号，头像已经**下载到后端本地**了（avatars/<账号id>.<ext>），
+// 这里优先读本地那张；没同步过 / 加载失败就回退成上面的文字头像。
+//
+// 为什么要走本地而不是直接用平台 CDN 地址：热链不一定放行、URL 可能带时效，
+// 表现就是头像随机裂图（详见 myUtils/account_stats/avatar.py 的说明）。
+const AVATAR_API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
+//: 本地头像缺失/加载失败的账号 id（失败过的就别再反复请求了）
+const avatarMissing = reactive(new Set())
+
+const avatarSrc = (row) => {
+  if (!row || !row.id || avatarMissing.has(row.id)) {
+    return getDefaultAvatar(row?.name || '')
+  }
+  // `<img>` 带不了请求头，登录态只能走查询串（和扫码登录那两个 SSE 一样）
+  return withToken(`${AVATAR_API_BASE}/account-stats/avatar/${row.id}`)
+}
+
+const onAvatarError = (row) => {
+  if (row && row.id) avatarMissing.add(row.id)
+  return false // 阻止 el-avatar 自己的默认回退，交给 :src 重算
+}
+
+// 账号列表刷新后，重新给"之前失败过"的账号一次机会
+// （同步完头像就该显示出来，不能因为一次 404 就永远显示文字头像）
+const resetAvatarCache = () => avatarMissing.clear()
 
 // SSE事件源对象
 let eventSource = null
@@ -890,7 +1051,9 @@ const connectSSE = (platform, name) => {
     '小红书': '1',
     '视频号': '2',
     '抖音': '3',
-    '快手': '4'
+    '快手': '4',
+    // 5 = 拼多多视频（多多视频）。这条 SSE 走的是「达人」扫码，见 myUtils/login.py
+    '拼多多视频': '5'
   }
 
   const type = platformTypeMap[platform] || '1'
@@ -1001,7 +1164,8 @@ const submitAccountForm = () => {
             '小红书': 1,
             '视频号': 2,
             '抖音': 3,
-            '快手': 4
+            '快手': 4,
+            '拼多多视频': 5
           };
           const type = platformTypeMap[accountForm.platform] || 1;
 
@@ -1123,6 +1287,15 @@ onBeforeUnmount(() => {
 .login-hint :deep(.el-alert__description) {
   word-break: break-all;
   line-height: 1.6;
+}
+/* 平台身份说明（目前只有拼多多视频用得上）：跟着平台下拉走，不要抢表单项的垂直间距 */
+.platform-hint {
+  margin: -8px 0 12px 80px;
+  width: calc(100% - 80px);
+}
+.platform-hint :deep(.el-alert__title) {
+  line-height: 1.5;
+  font-size: 12px;
 }
 .qrcode-container {
     margin-top: 20px;
