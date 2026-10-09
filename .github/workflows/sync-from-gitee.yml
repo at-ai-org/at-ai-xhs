@@ -1,0 +1,78 @@
+# 每 6 小时把 Gitee（源）镜像到 GitHub（只读镜像）。
+#
+# 方向是**单向**的：分支和 tag 一律以 Gitee 为准，GitHub 上多出来的分支会被 --prune
+# 删掉。所以**别直接在 GitHub 上改代码**——下次同步就会被 Gitee 的版本覆盖。
+#
+# 定时任务用的是 UTC：00 / 06 / 12 / 18 点 = 北京时间 08 / 14 / 20 / 02 点。
+# 想立刻同步一次，就 Actions 页面 → 这个 workflow → Run workflow（不用等定时）。
+#
+# ⚠️ 三件必须知道的事
+#   1. 这个文件本身也在被镜像的仓库里，所以它**必须同时存在于 Gitee 那一份**。
+#      只在 GitHub 上改它，下一次同步就会被 Gitee 的版本盖回去。
+#   2. GitHub 会在仓库连续 60 天没有任何活动后**自动停掉**定时任务（并给你发邮件）。
+#      正常情况下 Gitee 一有推送这里就有活动，轮不到它发生；真被停了，
+#      Actions 页面点一下「Enable workflow」即可恢复。
+#   3. GitHub 新建仓库的 GITHUB_TOKEN 默认是**只读**的。下面已经把 contents 提到 write；
+#      万一推送仍然 403，去 Settings → Actions → General → Workflow permissions
+#      选「Read and write permissions」，然后重跑一次。
+name: 同步 Gitee 到 GitHub
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  # 手动触发：Actions 页面 →「Run workflow」。第一次配好时用它当场验一遍。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一时刻只跑一个同步。排队而不是取消：两次重叠容易互相删 refs。
+concurrency:
+  group: sync-from-gitee
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取回本仓库（要完整历史）
+        uses: actions/checkout@v4
+        with:
+          # 镜像推送要能强制更新远端分支，浅克隆不够用
+          fetch-depth: 0
+
+      - name: 从 Gitee 取全部分支和 tag
+        run: |
+          set -euo pipefail
+          git remote add gitee https://gitee.com/zhoul.vic/at-ai-xhs.git
+          # 只取 refs/heads/* 和 refs/tags/*——**不带 refs/pull/*** 那些 GitHub
+          # 自己的内部 refs，免得后面推送时误删（那些 ref 也删不掉，会直接报错）。
+          # tag 前面加 + 是为了平台侧改过 tag 时能强制更新，不然 fetch 会拒绝。
+          git fetch --prune gitee \
+            "+refs/heads/*:refs/remotes/gitee/*" \
+            "+refs/tags/*:refs/tags/*"
+          echo "Gitee 侧的分支与 tag："
+          git for-each-ref --format='  %(refname:short)  %(objectname:short)' \
+            refs/remotes/gitee refs/tags
+
+      - name: 镜像推送到 GitHub
+        run: |
+          set -euo pipefail
+          if ! git push --prune origin \
+                 "+refs/remotes/gitee/*:refs/heads/*" \
+                 "+refs/tags/*:refs/tags/*"; then
+            echo "::error title=推送被拒绝::多半是 GITHUB_TOKEN 没有写权限。到 Settings → Actions → General → Workflow permissions 选「Read and write permissions」再重跑。"
+            exit 1
+          fi
+
+      - name: 汇报结果
+        run: |
+          set -euo pipefail
+          {
+            echo "### Gitee → GitHub 同步完成"
+            echo
+            echo "| 分支 / tag | commit |"
+            echo "| --- | --- |"
+            git ls-remote --heads --tags origin \
+              | awk '{print "| " $2 " | `" substr($1,1,7) "` |"}'
+          } >> "$GITHUB_STEP_SUMMARY"
