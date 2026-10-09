@@ -21,25 +21,6 @@ AI 只做「看懂视频 + 起草文案」这一段，**发布动作本身仍然
 音乐库，然后在「素材管理」里对一条视频点操作栏的「背景音乐」——原音轨被整条换成这首音乐
 （音乐比视频短就循环铺满），成品直接叫「原名-音乐名.mp4」，一眼看出用的是哪首。
 
-## 当前进度
-
-| 阶段 | 状态 |
-| --- | --- |
-| **前后端 Web 服务** | ✅ 扫码登录 / 自检 / 合集 / 发布，全部网页操作 |
-| **发布中心实时进度 + 发布记录** | ✅ 每个平台/账号/任务独立进度，发过的都留档 |
-| **任务手动中断** | ✅ 每个任务都能中断（排队中/正在跑的），卡住不用等 30 分钟看门狗 |
-| **重复发布二次确认** | ✅ 同一个账号已发过的素材再发一次，提交前列出来让人确认 |
-| **视频理解 → 文案生成** | ✅ 抽首尾帧 → 视觉模型 → 标题/正文/话题，结果落库到素材 |
-| **素材管理 + AI 文案留存** | ✅ 素材库统一管理，文案生成一次后续发布直接带出 |
-| **背景音乐** | ✅ 上传自己的音乐库，一键把素材原音轨**换成**背景音乐（比视频短就循环），文件名留痕 |
-| **设置（OpenAI 兼容）** | ✅ 服务地址/Key/模型/字数上限/发布默认值，网页配置 |
-| **账号会话定时续期** | ✅ 每天 0 / 7 / 14 / 20 点自动给全部账号续一次登录态（时间点可在「设置」里改，默认开启） |
-| **账号数据详情（粉丝 / 互动 / 作品）** | ✅ 「账号管理」每行一个「详情」：粉丝数与涨跌趋势、播放/点赞/收藏/评论/分享、逐条作品数据 |
-| **账号数据同步** | ✅ 会话续期定时任务顺带同步、详情页「同步」按钮手动同步、账号刚加进来时自动同步一次，全部覆盖本地库 |
-| **登录鉴权** | ✅ 账号 `admin` + 首次启动随机密码（存 `settings.json`），全部页面与接口都要登录 |
-| 合集自动匹配（算法） | ⬜ 未开始（选择动作已实现，AI 也能按内容选） |
-| 编排 / 审核 UI | ⬜ 未开始（单条确认已实现，批量审批未做） |
-
 ## 环境要求
 
 | 依赖 | 版本 | 说明 |
@@ -121,7 +102,8 @@ cd db && ../.venv/bin/python createTable.py && cd ..
 脚本会自动：结束占用 `5409` / `5173` 的旧进程（优雅退出超时则 `kill -9`，并连同子进程一起清理）、
 等待服务真正就绪后才返回、把日志写到 `logs/`、PID 写到 `.run/`。
 
-启动后打开 **http://localhost:5173**，**先用下面的账号密码登录**，再进「小红书工作台」。
+启动后打开 **http://localhost:5173**，**先用后台账号 `admin` 登录**（密码见[登录与鉴权](#登录与鉴权)），
+再进「小红书工作台」。
 
 <details>
 <summary>手动启动（两个终端）</summary>
@@ -297,7 +279,7 @@ cd sau_frontend && npm run dev
 | 互动数据 | 播放 / 点赞 / 收藏 / 评论 / 分享 / 涨粉 / 完播率… 每个指标一行：**迷你趋势图 + 区间数值 + 环比**，可在近 7 天 / 近 30 天之间切 |
 | 作品数据 | 逐条作品的封面、发布时间、时长、播放 / 点赞 / 收藏 / 评论 / 分享 / 吸粉 / 完播率 |
 
-四个平台的**实现方式不一样**，因为它们的门槛完全不一样：
+五个平台的**实现方式不一样**，因为它们的门槛完全不一样：
 
 | 平台 | 取数方式 | 实测耗时 | 拿得到什么 |
 | --- | --- | --- | --- |
@@ -352,7 +334,7 @@ cd sau_frontend && npm run dev
 - **作品级的「吸粉」「完播率」列按平台出现**：小红书和抖音的作品接口有，快手/视频号没有。
 
 代码：接口 `sau_backend_stats.py`（前缀 `/account-stats`），抓取 `myUtils/account_stats/`
-（`base.py` 定规范化结构 + 四个平台各一个适配器），缓存 `myUtils/account_stats/cache.py`，
+（`base.py` 定规范化结构 + 五个平台各一个适配器），缓存 `myUtils/account_stats/cache.py`，
 组件 `sau_frontend/src/components/AccountStatsButton.vue` + `AccountStatsDialog.vue`。
 测试 `tests/test_account_stats.py`。
 
@@ -403,7 +385,7 @@ cd sau_frontend && npm run dev
 | 音乐比视频短 | **自动循环播放**铺满整条视频（`-stream_loop -1` + `-t 视频时长`） |
 | 音乐比视频长 | 在视频结束处截断，成品时长永远跟着视频 |
 | 画质 | 视频流 `-c:v copy` 不重编码；音频重编码成 AAC 192k |
-| 封装 | 沿用素材的扩展名（`.MOV` 出来还是 `.MOV`）；但素材视频轨是 **av1/vp9** 这类 mov 封装**写不进去**的编码时，自动改用 mp4 封装——两者同属 ISO-BMFF，画面照样 copy。按扩展名硬套 mov muxer 的话 ffmpeg 在写头阶段就报 -22，日志里只会看到音频线程的 `af#0:1 Invalid argument`，跟音频其实无关 |
+| 封装 | 沿用素材的扩展名（`.MOV` 出来还是 `.MOV`）；视频轨是 **av1/vp9** 这类 mov 封装写不进去的编码时自动改用 mp4 封装（同属 ISO-BMFF，画面照样 copy）。硬按扩展名套 mov muxer 的话 ffmpeg 写头就报 -22，而日志里只会看到音频线程的 `af#0:1 Invalid argument`，跟音频其实无关 |
 | 进度 | 界面实时显示百分比——那个数字是 ffmpeg 的真实写入位置（`-progress`），不是估算 |
 | 结果 | **原地替换**：成品写成 `原名-音乐名.mp4`，原文件删除，AI 文案跟着改名迁移 |
 | 反复合成 | 再换一首会先剥掉上一次的「-音乐名」后缀，不会滚成 `标题-音乐A-音乐B.mp4` |
@@ -541,9 +523,10 @@ cd sau_frontend && npm run dev
   驱动会自动勾协议并点确认；**页脚另有一个全局「一键发布」**，那是"发布所有视频"，驱动不会去点它。
 - 平台不收**无音轨**的视频（作品管理会显示「生成失败：视频无音频，请更换视频」）。
 - **平台侧上传偶发不响应**（实测一批 22 条里有 3 条：文件已选中，平台始终没建出视频卡片）。
-  驱动会在 45 秒无进展后判定卡住，**自动重载页面并重传一次**；仍不行就带原因快速失败，
-  不会再安静地等 10 分钟。相关阈值：`SAU_PDD_UPLOAD_STALL`（默认 120 秒）、
-  `SAU_PDD_UPLOAD_RETRIES`（默认 1）。
+  两个阈值分工不同：进度文案 **45 秒**一个字都没变（写死在驱动里，正常上传每几秒就会变一次），
+  或整体超过 `SAU_PDD_UPLOAD_STALL` 秒（默认 120）还没完成 → 判定卡住，
+  **自动重载页面并重传一次**（`SAU_PDD_UPLOAD_RETRIES`，默认 1 次）；仍不行就带原因快速失败，
+  不会再安静地等 10 分钟。
 - 接口回执的信封是 `{success, errorCode, errorMsg, result}`，**成功时 `errorCode` 也非空**
   （`1000000`）。判读时必须把成功码当白名单，否则会把"发布成功"读成"失败"——
   真机上就发生过一次（平台上作品都在，发布记录却写失败）。
@@ -667,7 +650,7 @@ GET  /getFile           下载/预览单个素材
 GET  /deleteFile        删除素材
 GET  /getAccounts       账号列表
 GET  /getValidAccounts  校验所有 cookie（较慢）
-GET  /login             扫码登录（SSE，?type=1|2|3|4）
+GET  /login             扫码登录（SSE，?type=1|2|3|4|5）
 POST /updateUserinfo    账号改名
 GET  /deleteAccount     删除账号
 POST /uploadCookie      上传 cookie 文件
@@ -684,7 +667,7 @@ POST /session-renew     改开关或时间点（body: enabled / times，只传�
 ```
 
 刻意**不放在 `/xhs` 前缀下**：续期的对象是「账号管理」里的全部账号（快手 / 抖音 /
-视频号 / 小红书），跟小红书无关。调度本体见 `myUtils/session_renew.py`。
+视频号 / 小红书 / 拼多多视频），跟小红书无关。调度本体见 `myUtils/session_renew.py`。
 
 ### 账号数据详情（`sau_backend_stats.py`，前缀 `/account-stats`）
 
@@ -699,7 +682,7 @@ POST /account-stats/sync          手动同步一个账号：拉平台实时数�
 GET  /account-stats/summary       所有账号的粉丝数一览：**只读缓存，绝不触发抓取**
 ```
 
-同样刻意**不放在 `/xhs` 前缀下**：这份数据对四个平台一视同仁。
+同样刻意**不放在 `/xhs` 前缀下**：这份数据对五个平台一视同仁。
 
 两个接口的分工是刻意的：`/account-stats` 给**详情弹窗**用，`?refresh=1` 时真的去开浏览器
 （几秒到十几秒），所以它**永远先返回缓存**、并把"新不新鲜"（`stale` / `age_seconds`）交给前端；
@@ -784,10 +767,10 @@ docker run -d --name at-ai-xhs -p 5409:5409 \
 
 | 路径 | 内容 | 建议 |
 |---|---|---|
-| `/app/videoFile` | 素材文件（本机已 700MB+） | bind mount（宿主上就有素材） |
+| `/app/videoFile` | 素材文件（几百 MB 到几 GB，宿主机上本来就攒着） | bind mount（宿主上就有素材） |
 | `/app/bgmFile` | 背景音乐文件（用户上传的音乐库；合成后的成品仍在 `videoFile`） | bind mount 或命名卷 |
 | `/app/cookiesFile` | 发布中心的账号 cookie（一行一个账号，登记在 `db` 的 `user_info`） | bind mount |
-| `/app/cookies` | 小红书工作台/CLI 的 cookie + **视频号的持久化浏览器 profile**（154MB） | **命名卷**，见下面的警告 |
+| `/app/cookies` | 小红书工作台/CLI 的 cookie + **视频号的持久化浏览器 profile**（几十到几百 MB） | **命名卷**，见下面的警告 |
 | `/app/db` | `database.db`（素材、账号、发布记录） | 命名卷（宿主上那份 macOS 库不一定兼容） |
 | `/app/logs` | 各平台日志 | 命名卷 |
 | `/app/settings.json` | 模型设置 + 续期时间点 + 后台登录密码/`secret_key`，**都是明文** | bind mount 或挂卷，否则重建就丢 |
@@ -800,7 +783,7 @@ docker run -d --name at-ai-xhs -p 5409:5409 \
 > 不一致，等于给视频号换了一台设备——反而是会话保活最怕的事。要么用命名卷
 > 让容器自己养，要么在容器里重新扫码登录。
 >
-> 扫码登录**不需要显示器**：四个平台的二维码都会通过 `/login` 的 SSE 推给网页，
+> 扫码登录**不需要显示器**：五个平台的二维码都会通过 `/login` 的 SSE 推给网页，
 > 在浏览器里扫就行（`utils/login_qrcode.py` 负责解码，容器里也必须有 libGL，
 > Dockerfile 已经装上）。
 >
@@ -878,12 +861,13 @@ at-ai-xhs/
 │   └── main.py                 ← 发布编排
 ├── tools/                      开发辅助脚本（Vue 绑定检查、素材页/背景音乐页/登录页验收、
 │                               小红书页面操作层无账号冒烟）
-├── tests/                      单元测试（34 个文件、499 个用例；每个文件都对应一次真实事故或契约）
+├── tests/                      单元测试（35 个文件、514 个用例；每个文件都对应一次真实事故或契约）
 ├── db/                         建库脚本与 SQLite 数据库
 ├── videoFile/                  素材文件（上传的成品都在这里，已 gitignore）
 ├── bgmFile/                    背景音乐文件（和素材分开存，见 myUtils/background_music.py）
 └── uploader/ utils/ skills/ ...   上游其余模块
-    （上游 README 的配图目录 media/、static/、旧说明目录 sau_backend/ 已于 2026-09-30 清理）
+    （上游 README 的本地副本 README.upstream.md、配图目录 media/、static/、
+      旧说明目录 sau_backend/ 已于 2026-09-30 清理）
 ```
 
 ## 环境变量
@@ -891,13 +875,24 @@ at-ai-xhs/
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `SAU_MAX_CONCURRENT_BROWSERS` | `4` | 整机同时最多开几个浏览器（工作台与发布中心共用） |
+| `SAU_LOCK_WAIT_TIMEOUT` | `600` | 等「账号锁 / 并发名额」的上限秒数。线程杀不掉，没有上限就会永久占着锁——超时抛 `BrowserLockTimeout`，最坏也是"几分钟后带原因失败"。必须小于发布看门狗的 30 分钟 |
+| `SAU_PUBLISH_TASK_TIMEOUT` | `1800` | 单条发布任务的上限秒数（发布中心与工作台共用），到点判失败 |
 | `BACKEND_PORT` | `5409` | `start.sh` 启动的后端端口 |
 | `FRONTEND_PORT` | `5173` | `start.sh` 启动的前端端口 |
 | `PLAYWRIGHT_BROWSERS_PATH` | `<项目>/.browsers` | 浏览器内核安装位置，由 `conf.py` 设默认值 |
 | `SAU_XHS_CREATOR_BASE_URL` | `https://creator.xiaohongshu.com` | 小红书创作平台地址 |
 | `DOUYIN_COOKIE_AUTH_HEADLESS` | `true` | 抖音 cookie 校验是否用无头浏览器 |
+| `SAU_TENCENT_HEADLESS` | `true` | 视频号（登录 / 校验 / 发布）的无头开关，设 `0` 切成有头 |
+| `SAU_TENCENT_CLEANUP_TIMEOUT` | `30` | 视频号关浏览器（`context.close()`）的上限秒数。实测过它一直不返回，卡住就会把账号锁永久占着 |
+| `SAU_PDD_HEADLESS` | `true` | 拼多多视频（登录 / 校验 / 发布共用）的无头开关；选择器还没实测过时建议设 `0` 有头跑一次 |
+| `SAU_PDD_UPLOAD_STALL` | `120` | 拼多多上传多少秒没进展判定卡住 → 自动重载页面重传一次 |
+| `SAU_PDD_UPLOAD_RETRIES` | `1` | 上面那次重传最多来几回 |
+| `SAU_PDD_DUMP` | `false` | 设 `1`：拼多多每一步都往 `pdd_debug/` 落一份 HTML + 全页截图，改选择器时直接看现场 |
+| `SAU_PDD_TRACE` | 未设置 | 设 `1`：临时打开上面的留现场，不用改 `conf.py` |
+| `SAU_SESSION_RENEW_TICK` | `30` | 续期调度器每隔几秒看一次配置与时间点（所以改时间点不用重启） |
+| `SAU_SESSION_RENEW_RETRY_DELAY` | `600` | 撞上这个账号正在发布时，隔多久补一次续期（最多补 2 次） |
 | `SAU_BGM_COMPOSE_TIMEOUT` | `1800` | 单次「合成背景音乐」的上限秒数，到点杀掉 ffmpeg 并回落成「待合成」 |
-| `YT_PROXY` | `None` | YouTube 上传用的代理（`conf.py` 内配置） |
+| `YT_PROXY` | `None` | YouTube 上传用的代理（`conf.py` 内配置，不是环境变量） |
 
 ## ⚠️ 使用须知
 
