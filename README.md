@@ -725,7 +725,7 @@ GET  /account-stats/summary       所有账号的粉丝数一览：**只读缓�
 无需账号的冒烟测试（验证浏览器链路是否正常）：
 
 ```bash
-.venv/bin/python examples/xhs_page_ops_smoke.py
+.venv/bin/python tools/verify_xhs_page_ops.py
 ```
 
 ## 测试
@@ -876,9 +876,9 @@ at-ai-xhs/
 │   ├── page_ops.py             ← 页面操作层
 │   ├── ai_copywriter.py        ← AI 文案生成（抽首尾帧 → 视觉模型）
 │   └── main.py                 ← 发布编排
-├── examples/xhs_page_ops_smoke.py   ← 无账号冒烟测试
-├── tools/                      开发辅助脚本（Vue 绑定检查、素材页/背景音乐页验收）
-├── tests/                      单元测试
+├── tools/                      开发辅助脚本（Vue 绑定检查、素材页/背景音乐页/登录页验收、
+│                               小红书页面操作层无账号冒烟）
+├── tests/                      单元测试（34 个文件、499 个用例；每个文件都对应一次真实事故或契约）
 ├── db/                         建库脚本与 SQLite 数据库
 ├── videoFile/                  素材文件（上传的成品都在这里，已 gitignore）
 ├── bgmFile/                    背景音乐文件（和素材分开存，见 myUtils/background_music.py）

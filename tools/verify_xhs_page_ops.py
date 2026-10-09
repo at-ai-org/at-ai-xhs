@@ -16,9 +16,14 @@
 
 用法::
 
-    python examples/xhs_page_ops_smoke.py            # 无头（用 patchright 自带的 chromium）
-    python examples/xhs_page_ops_smoke.py --headed   # 有头，肉眼确认
-    python examples/xhs_page_ops_smoke.py --channel chrome   # 改用本机 Google Chrome
+    python tools/verify_xhs_page_ops.py            # 无头（用 patchright 自带的 chromium）
+    python tools/verify_xhs_page_ops.py --headed   # 有头，肉眼确认
+    python tools/verify_xhs_page_ops.py --channel chrome   # 改用本机 Google Chrome
+
+（2026-10-09 从 `examples/xhs_page_ops_smoke.py` 挪到这里：`tools/` 下本来就是这一类
+验收 / 冒烟脚本——`verify_login_page.py`、`verify_material_page.py`……而 `examples/`
+那个目录只剩它一个文件，`__init__.py` 是空的、全仓也没有一处 import 它。
+`docs/小红书页面操作层.md` 第五节「本机实测通过（无需账号）」那张表引用的就是本脚本。）
 """
 
 from __future__ import annotations
