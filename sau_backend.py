@@ -11,7 +11,6 @@ from queue import Queue
 from flask_cors import CORS
 from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
-from werkzeug.utils import secure_filename
 from conf import BASE_DIR
 from myUtils import publish_records
 from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen, get_pdd_cookie
@@ -118,21 +117,48 @@ def logo_svg():
 def index():  # put application's code here
     return send_from_directory(current_dir, 'index.html')
 
-def _safe_upload_name(original: str) -> str:
-    """生成安全的素材文件名。
+#: 素材文件名白名单：**中文 + 字母 + 数字 + 下划线/连字符**。
+#:
+#: 为什么不用 werkzeug 的 `secure_filename`：它只保留 ASCII、把中文整段丢掉。要命的是
+#: 它**不是全丢**——`12345城市海岸线的日落.mp4` 会被清成 `12345.mp4`，主名和扩展名都还在，
+#: 于是旧逻辑里那句"清洗结果合法就直接用"的判断把它放行了，中文被**静默**删掉：
+#: 用户在素材管理里看到的就是"文件名只剩下前面的数字"（2026-10-09 反馈）。
+#: 纯中文名反而没事——那种会被清成 `mp4`（连点都没了），恰好触发旧的兜底分支。
+#:
+#: 所以这里自己按白名单洗：中文照留，`\u4e00-\u9fff` 是常用汉字，
+#: `\u3400-\u4dbf` 是扩展 A 区（生僻字）。
+_UPLOAD_NAME_KEEP_RE = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff\u3400-\u4dbf]")
 
-    werkzeug 的 secure_filename 只保留 ASCII：纯中文名 "上传测试视频.mp4" 会被清成 "mp4"
-    ——连点都没了，扩展名直接丢失，后续 ffmpeg 抽帧和平台上传都会失败。
-    所以策略是：清洗后如果拿不到合法的"主名.扩展名"，就退化成时间戳名并保留原扩展名。
+#: 主名长度上限（字符数）。中文一个字 3 字节，而文件名在 Linux 上是 255 **字节**封顶
+#: （APFS 同理），前面还要拼 36 字符的 uuid：50 个汉字 ≈ 150 字节，
+#: 加 uuid 和扩展名仍在 200 字节以内。
+_UPLOAD_NAME_MAX = 50
+
+
+def _safe_upload_name(original: str) -> str:
+    """生成安全的素材文件名，**保留中文**。
+
+    规则：
+
+    * 只取 basename——浏览器可能送来 `C:\\fakepath\\xx.mp4` 这种带路径的名字；
+    * 主名只保留**中文 / 字母 / 数字 / `_` / `-`**，其余（空格、标点、emoji、点）一律丢掉；
+    * 连续分隔符压成一个，首尾的分隔符去掉；
+    * 洗不出主名（纯 emoji、纯标点之类）才退化成时间戳名，扩展名照原样带上。
+
+    安全性与 `secure_filename` 等价：`.` 和路径分隔符都不在白名单里（所以拼不出 `..`、
+    也不可能跑到别的目录），开头的 `-` 会被去掉（那种名字传给命令行会被当成选项）。
     """
-    original = (original or "").strip()
-    ext = Path(original).suffix.lower()
-    if not re.fullmatch(r"\.[a-z0-9]{1,6}", ext or ""):
+    original = (original or "").strip().replace("\\", "/")
+    ext = Path(original).suffix
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,6}", ext or ""):
         ext = ".mp4"
-    cleaned = secure_filename(original)
-    if cleaned and cleaned.lower().endswith(ext) and Path(cleaned).stem:
-        return cleaned
-    return f"video_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+    stem = Path(original).stem if Path(original).suffix else Path(original).name
+    stem = _UPLOAD_NAME_KEEP_RE.sub("", stem)
+    # 洗掉字符之后可能留下一串分隔符（"我的视频 - 01" → "__-__"），收敛一下再截断
+    stem = re.sub(r"[_-]{2,}", "_", stem).strip("_-")[:_UPLOAD_NAME_MAX].strip("_-")
+    if not stem:
+        return f"video_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+    return f"{stem}{ext}"
 
 
 @app.route('/upload', methods=['POST'])
