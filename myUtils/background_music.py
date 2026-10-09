@@ -24,6 +24,14 @@
 用 `-progress pipe:1` 让 ffmpeg 自己把 `out_time_us=` 吐到 stdout，再除以视频总时长。
 不是估算，是它真正写到哪儿了。（ffmpeg 里 `out_time_ms=` 实际也是微秒——历史遗留，
 所以优先读 `out_time_us`，两个都当微秒用。）
+
+输出封装为什么由视频编码决定
+----------------------------
+换音轨是 `-c:v copy`（画面不重编码），前提是**这个容器装得下这条视频轨**。mov 封装对
+av1/vp9 是写头就拒收的（`av1 only supported in MP4 and AVIF`），于是 ffmpeg 整个以 -22
+收场，而日志末尾只剩下音频 filter 线程的 `af#0:1 ... Invalid argument`——看着像音频坏了，
+其实跟音频毫无关系。所以扩展名照旧（`原名-音乐名.MOV`，文件名是用户看得见的东西），
+muxer 改用 mp4：两者同属 ISO-BMFF 家族，画面照样 copy。判定见 `_muxer_args`。
 """
 
 from __future__ import annotations
@@ -74,6 +82,19 @@ _ILLEGAL_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 _STREAM_RE = re.compile(r"Stream #\d+:\d+[^:]*:\s*(Video|Audio):")
+#: 第一条视频轨的编码名：`Stream #0:0[0x1](und): Video: av1 (libaom-av1) ...` → `av1`。
+#: 合成时要靠它挑输出封装（`-c:v copy` 能不能塞进这个容器全看它），见 `_muxer_args`。
+_VCODEC_RE = re.compile(r"Stream #\d+:\d+[^:]*:\s*Video:\s*([A-Za-z0-9_]+)")
+
+#: mov 封装**写不进去**、而 mp4 封装能写的视频编码。ffmpeg 的 mov muxer 在写头时直接拒收
+#: （av1 报 `av1 only supported in MP4 and AVIF`，vp9 报 `vp9 only supported in MP4`），
+#: 然后整个进程以 -22 退出。GPAC 之类工具导出的 `.MOV` 里装 av1 很常见（那类文件本体
+#: 就是 ISO-BMFF，扩展名叫什么都行），不换 muxer 的话给它们换音轨必然失败。
+_MOV_REJECTED_VCODECS = frozenset({"av1", "vp9"})
+
+#: 默认就走 mov muxer 的扩展名（`.MOV` / `.QT` → qt）。只有这些扩展名才需要"换 muxer"：
+#: `.mp4`/`.m4v` 本来就是 mp4 家族，`.mkv`/`.webm` 换成 mp4 反而是另一种错。
+_MOV_FAMILY_EXTS = frozenset({".mov", ".qt"})
 
 
 # --------------------------------------------------------------------------- #
@@ -444,11 +465,14 @@ def build_output_name(
 
 
 def probe_media(path) -> dict:
-    """读媒体的时长和轨道情况：`{"duration": 秒|None, "has_video": bool, "has_audio": bool}`。
+    """读媒体的时长和轨道情况。
+
+    返回 `{"duration": 秒|None, "has_video": bool, "has_audio": bool, "vcodec": 编码名|None}`。
+    `vcodec` 是第一条视频轨的编码（`av1` / `h264` / `hevc` …），合成时用它挑输出封装。
 
     只用 ffmpeg（见模块开头：没有 ffprobe），解析 `ffmpeg -i` 的 stderr。
     """
-    info = {"duration": None, "has_video": False, "has_audio": False}
+    info = {"duration": None, "has_video": False, "has_audio": False, "vcodec": None}
     ffmpeg = find_ffmpeg()
     if not ffmpeg or not Path(str(path)).is_file():
         return info
@@ -469,7 +493,29 @@ def probe_media(path) -> dict:
     streams = _STREAM_RE.findall(text)
     info["has_video"] = "Video" in streams
     info["has_audio"] = "Audio" in streams
+    codec = _VCODEC_RE.search(text)
+    if codec:
+        info["vcodec"] = codec.group(1).lower()
     return info
+
+
+def _muxer_args(out_path, vcodec: str | None) -> list[str]:
+    """按视频编码挑输出封装，返回要追加到命令行里的参数（多数情况下是空的）。
+
+    只看扩展名是不够的：`-c:v copy` 的前提是"目标容器装得下这条视频轨"，而 `.MOV` 走的是
+    mov muxer，它对 av1/vp9 写头就拒收。那种素材的换音轨必然失败，且报错完全指不到原因
+    （进程以 -22 退出，日志末尾只剩音频 filter 线程的 `af#0:1 ... Invalid argument`）——
+    见 `_MOV_REJECTED_VCODECS` 里的说明。
+
+    这些情况改用 mp4 muxer 而不是改扩展名：mov 与 mp4 同属 ISO-BMFF，画面流照样 copy，
+    而文件名（`原名-音乐名.MOV`）是用户和发布链路都在看的东西，不该为了换个 muxer 去动它。
+    """
+    if (
+        (vcodec or "").lower() in _MOV_REJECTED_VCODECS
+        and Path(str(out_path)).suffix.lower() in _MOV_FAMILY_EXTS
+    ):
+        return ["-f", "mp4"]
+    return []
 
 
 def compose_video_with_music(
@@ -487,7 +533,9 @@ def compose_video_with_music(
     - **原音轨整条不要**：只 `-map 0:v:0`，视频自带的音频不参与输出；
     - **音乐短了就循环**：`-stream_loop -1` 无限循环，`-t <视频时长>` 在视频结束处收尾
       （音乐比视频长时，同一条 `-t` 会把多出来的截掉）；
-    - **画面不重编码**：`-c:v copy`，换音轨跟画质无关，重编码只会白白损失画质、慢几十倍。
+    - **画面不重编码**：`-c:v copy`，换音轨跟画质无关，重编码只会白白损失画质、慢几十倍；
+    - **封装跟着编码走**：输出容器装不下这条视频轨时改用 mp4 muxer（扩展名不变），
+      否则 `.MOV` 里的 av1/vp9 会在写头阶段就把 ffmpeg 打死，见 `_muxer_args`。
 
     返回 `(是否成功, 失败原因)`。失败时会把半成品清掉——不能让一个残缺的 mp4
     留在目录里被当成素材。
@@ -525,6 +573,9 @@ def compose_video_with_music(
     else:
         # 探测不到时长时退化成"谁短听谁的"：音乐是无限循环的，所以这里一定是视频先结束
         cmd += ["-shortest"]
+    # 封装要放在输出文件**紧前面**：`-f` 是输出侧的选项，紧贴着它作用的那一个输出最不容易看错；
+    # 这里的 probe 只读文件头（几十毫秒），换来的是一条一定能跑通的命令，见 `_muxer_args`。
+    cmd += _muxer_args(out, probe_media(src).get("vcodec"))
     cmd.append(str(out))
 
     try:

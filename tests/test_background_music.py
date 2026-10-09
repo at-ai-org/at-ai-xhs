@@ -104,12 +104,12 @@ class _MusicTestCase(unittest.TestCase):
             raise AssertionError(proc.stderr.decode("utf-8", "ignore"))
 
     @classmethod
-    def _render_video(cls, path, seconds, tone, audio_codec="aac"):
+    def _render_video(cls, path, seconds, tone, audio_codec="aac", video_codec="libx264", extra=()):
         cls._run(
             [
                 "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=15:duration={seconds}",
                 "-f", "lavfi", "-i", f"sine=frequency={tone}:duration={seconds}",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:v", video_codec, *extra, "-pix_fmt", "yuv420p",
                 "-c:a", audio_codec, "-shortest", str(path),
             ]
         )
@@ -535,3 +535,71 @@ class ComposeTest(_MusicTestCase):
         snap = self.compose_and_wait(self.material, music_id)
         statuses = self.client.get("/music/statuses").get_json()["data"]
         self.assertEqual(statuses[snap["output"]]["status_text"], "已合成")
+
+
+class Av1InMovComposeTest(_MusicTestCase):
+    """`.MOV` 里装 av1 的素材：换音轨必须自动改用 mp4 封装。
+
+    真机上踩到的坑：`-c:v copy` 把 av1 原样带进 mov 封装，ffmpeg 在**写头**阶段就被拒
+    （`av1 only supported in MP4 and AVIF`），整个进程以 -22 退出——而日志末尾只剩音频
+    filter 线程的 `af#0:1 ... Invalid argument`，看着像音频坏了，其实音频完全无辜。
+    所以这里不看返回值，而是证明"成品真的能整条解出来"。
+    """
+
+    #: 素材名带大写 `.MOV`，和用户手里那份（GPAC 导出）一致
+    MATERIAL = "av1素材.MOV"
+
+    def _make_av1_mov(self) -> None:
+        """造一条"扩展名 .MOV、视频轨是 av1"的素材。
+
+        只能先编码成 mp4 再改名：ffmpeg 自己也不肯把 av1 写进 mov 封装，而这正是要绕开的
+        那条限制。真实素材就是这么来的——容器本体就是 ISO-BMFF，扩展名叫 .mp4 还是 .MOV
+        都读得出来，出问题的只是"输出时按扩展名选的 muxer"。
+        """
+        tmp = self.root / "av1_tmp.mp4"
+        try:
+            self._render_video(
+                tmp,
+                3,
+                VIDEO_TONE,
+                video_codec="libaom-av1",
+                extra=["-cpu-used", "8", "-crf", "50", "-b:v", "0"],
+            )
+        except AssertionError as exc:  # 这个 ffmpeg 没编进 av1 编码器就跳过，不当成失败
+            self.skipTest(f"这个 ffmpeg 编不了 av1: {exc}")
+
+        tmp.replace(self.root / "videoFile" / self.MATERIAL)
+        with sqlite3.connect(self.root / "db" / "database.db") as conn:
+            conn.execute(
+                "INSERT INTO file_records (filename, filesize, file_path) VALUES (?, ?, ?)",
+                (self.MATERIAL, 1.0, self.MATERIAL),
+            )
+            conn.commit()
+
+    def test_av1_in_mov_still_composes_and_stays_readable(self):
+        self._make_av1_mov()
+        self.assertEqual(
+            bgm.probe_media(self.root / "videoFile" / self.MATERIAL)["vcodec"], "av1"
+        )
+
+        music_id = self.upload_music(self.root / "short.mp3", "轻音乐")
+        snap = self.compose_and_wait(self.MATERIAL, music_id)
+
+        self.assertEqual(snap["state"], "done", snap)
+        self.assertEqual(snap["output"], "av1素材-轻音乐.MOV", "扩展名保持素材原样")
+        out = self.root / "videoFile" / snap["output"]
+        self.assertTrue(out.is_file())
+
+        info = bgm.probe_media(out)
+        self.assertAlmostEqual(info["duration"], 3.0, delta=0.3)
+        self.assertTrue(info["has_video"])
+        self.assertTrue(info["has_audio"])
+        # 只是换了封装：画面流没重编码，编码还是 av1
+        self.assertEqual(info["vcodec"], "av1")
+
+        # 整条流真的能解出来——只看"文件在、探测得到轨道"是验不出空壳文件的
+        proc = subprocess.run(
+            [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(out), "-f", "null", "-"],
+            capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "ignore"))
