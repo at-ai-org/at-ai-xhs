@@ -2,9 +2,13 @@ import { http } from '@/utils/request'
 
 // 账号管理相关API
 export const accountApi = {
-  // 获取有效账号列表（带验证）
-  getValidAccounts() {
-    return http.get('/getValidAccounts')
+  // 校验登录态。传 accountId 就只校验那一个账号（「账号管理」页刷新时一个账号一条请求，
+  // 各自更新各自那一行，互不阻塞）；不传就是校验全部（脚本 / 历史调用的用法）。
+  // 响应里除了 data，还多带一个 verify：{total, ok, invalid, busy, error, duration_ms, results}。
+  // 注意 busy / error 表示"这次没校验成"（账号正在发布、cookie 文件丢了…），
+  // 它的状态没有被改动——别把它当成"失效"。
+  getValidAccounts(accountId) {
+    return http.get(accountId ? `/getValidAccounts?id=${accountId}` : '/getValidAccounts')
   },
 
   // 获取账号列表（不带验证，快速加载）

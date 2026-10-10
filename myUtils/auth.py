@@ -1,11 +1,14 @@
 import asyncio
 import configparser
 import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Mapping, Sequence
 
 from playwright.async_api import async_playwright
 from xhs import XhsClient
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, PDD_HEADLESS
+from myUtils.browser_lock import MAX_CONCURRENT_BROWSERS, BrowserLockTimeout, browser_session
 from utils.base_social_media import set_init_script
 from utils.log import kuaishou_logger, douyin_logger
 from pathlib import Path
@@ -204,3 +207,137 @@ async def check_cookie(type, file_path, save_state: bool = False):
 
 # a = asyncio.run(check_cookie(1,"3a6cfdc0-3d51-11f0-8507-44e51723d63c.json"))
 # print(a)
+
+
+# --------------------------------------------------------------------------- #
+# 并发校验一批账号（「账号管理」页点刷新时用）
+# --------------------------------------------------------------------------- #
+#: 账号 cookie 文件所在目录（`user_info.filePath` 就是这里的文件名）。
+COOKIE_DIR = Path(BASE_DIR) / "cookiesFile"
+
+#: 校验一个账号时，最多等多久「浏览器名额 / 账号锁」（秒）。
+#:
+#: 这不是"校验超时"，而是**排队上限**：这个账号正在发布时同账号不能再开第二个浏览器
+#: （会互相踢下线），所以要等；但界面上的刷新不能因为这个账号在发东西就无限期转圈。
+#: 等不到就当这次没校验——**状态原样不动**，比"猜一个结论"安全。用
+#: SAU_VERIFY_WAIT_TIMEOUT 覆盖。后台的定时续期不用这个值：它是 wait_timeout=0，
+#: 碰上占用直接让路（见 myUtils/session_renew.py）。
+#:
+#: 默认 3 分钟，是按**排队**算的："账号管理"页是一个账号一条请求，账号比浏览器名额多时，
+#: 多出来的那些要等前面跑完。实测一个账号 25~30 秒，4 个名额就是每 ~30 秒放行 4 个，
+#: 180 秒足够排到 20 多个账号——不会出现"账号多了就有一半报没校验"。再往上就得调大它，
+#: 或者调大 SAU_MAX_CONCURRENT_BROWSERS。
+VERIFY_WAIT_TIMEOUT = float(os.environ.get("SAU_VERIFY_WAIT_TIMEOUT") or 180)
+
+#: 一条校验结论的四种取值。
+#:
+#: 和 `session_renew` 里那套字面量刻意保持一致（ok / invalid / busy / error），
+#: 但**不共用常量**：session_renew 反过来 import 本模块，共用会绕成循环 import。
+#: 两边读起来是一回事就够了——那边是"续期"的结论，这边是"校验"的结论。
+STATUS_OK = "ok"
+STATUS_INVALID = "invalid"
+STATUS_BUSY = "busy"
+STATUS_ERROR = "error"
+
+
+def _verify_one(
+    account: Mapping[str, Any], *, save_state: bool, wait_timeout: float | None
+) -> dict:
+    """校验一个账号，返回结论行（**不抛异常**，任何意外都变成一条 error 结论）。
+
+    结论里的 `ok` 有三种值：True（有效）、False（失效）、None（压根没校验成——
+    账号被占用、cookie 文件丢了、或者校验过程出错）。把"没校验"和"校验失败"分开，
+    是为了让调用方**别去改状态**：fail 才能写库，None 只能原样不动。
+    """
+    row = {
+        "id": account.get("id"),
+        "type": int(account.get("type") or 0),
+        "file_path": account.get("file_path") or "",
+        "name": account.get("name") or "",
+    }
+
+    if not row["file_path"]:
+        return {**row, "ok": None, "status": STATUS_ERROR, "message": "账号没有 cookie 文件，请重新扫码授权"}
+    account_path = COOKIE_DIR / row["file_path"]
+    if not account_path.is_file():
+        return {
+            **row,
+            "ok": None,
+            "status": STATUS_ERROR,
+            "message": f"cookie 文件不存在（{row['file_path']}），请重新扫码授权",
+        }
+
+    try:
+        # 账号锁 + 整机浏览器名额都在 browser_session 里，和发布中心用的是**同一把**
+        # （key 都是 cookiesFile 下的路径）：同一个账号正在发布时，这里不会另开一个浏览器
+        # 去踩它。等待有上限，超了就当这次没校验。
+        with browser_session(account_path, wait_timeout=wait_timeout):
+            ok = asyncio.run(check_cookie(row["type"], row["file_path"], save_state=save_state))
+    except BrowserLockTimeout:
+        return {**row, "ok": None, "status": STATUS_BUSY, "message": "该账号正在发布/续期中，这次先没校验"}
+    except Exception as exc:  # noqa: BLE001 —— 一个账号炸了不该让别的账号也跟着没结论
+        return {**row, "ok": None, "status": STATUS_ERROR, "message": f"校验出错: {exc}"}
+
+    if ok:
+        return {**row, "ok": True, "status": STATUS_OK, "message": "登录态有效"}
+    return {**row, "ok": False, "status": STATUS_INVALID, "message": "登录态已失效，需要重新扫码授权"}
+
+
+def check_accounts(
+    accounts: Sequence[Mapping[str, Any]],
+    *,
+    save_state: bool = False,
+    wait_timeout: float | None = VERIFY_WAIT_TIMEOUT,
+    max_workers: int | None = None,
+) -> list[dict]:
+    """并发校验多个账号的登录态：**一个账号一个线程、一个浏览器**。
+
+    改造的原因（原来的写法在 `/getValidAccounts` 里是一个 for 循环逐个 `await
+    check_cookie`）：每个账号都要开一次浏览器、等几个 5 秒级的超时，实测一个账号
+    十几秒到几十秒。串行的话 N 个账号就是 **N 份时间加起来**——账号一多，界面上
+    就是"所有账号都显示验证中"、等好几分钟，而且第一个账号慢会把后面的全堵住。
+
+    并发之后总耗时约等于**最慢的那个账号**，账号之间互不影响：一个平台挂了/超时了，
+    别的账号照样各自出结论。
+
+    真实并发上限不在这里，而是 `browser_lock` 那把"整机同时最多几个浏览器"的闸门
+    （默认 4）——所以线程数也只开到那个数（`MAX_CONCURRENT_BROWSERS`）：多开的线程
+    只是在闸门前干等，而且一样要受 `wait_timeout` 约束（30 个账号开 30 个线程的话，
+    排在最后的那些会白白耗到超时、报成"没校验"）。账号比名额多的时候，
+    排队发生在**线程池的队列**里——那里等待是免费的，不消耗 `wait_timeout`。
+
+    入参是 `[{"id", "type", "file_path", "name"}, ...]`（type 就是 `user_info.type`）。
+    返回**与入参同序**的结论行列表。调用方负责按结论写库——本函数不碰数据库。
+    """
+    items = [dict(account) for account in accounts]
+    if not items:
+        return []
+
+    if len(items) == 1:
+        # 一个账号就别为它开线程池了（"账号管理"页是一个账号一条请求，
+        # 这一路才是线上真正跑的那条）。
+        return [_verify_one(items[0], save_state=save_state, wait_timeout=wait_timeout)]
+
+    workers = max_workers or min(len(items), MAX_CONCURRENT_BROWSERS)
+    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="verify-account") as pool:
+        # map 保序：第 i 条结论一定对应第 i 个账号，调用方可以直接 zip。
+        return list(
+            pool.map(
+                lambda account: _verify_one(
+                    account, save_state=save_state, wait_timeout=wait_timeout
+                ),
+                items,
+            )
+        )
+
+
+__all__ = [
+    "COOKIE_DIR",
+    "STATUS_BUSY",
+    "STATUS_ERROR",
+    "STATUS_INVALID",
+    "STATUS_OK",
+    "VERIFY_WAIT_TIMEOUT",
+    "check_accounts",
+    "check_cookie",
+]

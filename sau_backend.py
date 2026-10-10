@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from queue import Queue
 from flask_cors import CORS
-from myUtils.auth import check_cookie
+from myUtils.auth import check_accounts
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
 from conf import BASE_DIR
 from myUtils import publish_records
@@ -405,36 +405,138 @@ def getAccounts():
         }), 500
 
 
+def _parse_account_ids(args) -> set | None:
+    """解析 `?id=3` / `?ids=1,3`：返回要校验的账号 id 集合，没给就是 None（= 全部）。
+
+    认不出来的一律**报错**而不是"当成全部"：`?id=abc` 悄悄退化成"校验所有账号"
+    会让调用方以为只查了一个，实际把全部浏览器都开了一遍——慢得莫名其妙还查不出原因。
+    """
+    raw = (args.get("ids") or args.get("id") or "").strip()
+    if not raw:
+        return None
+    ids = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(f"账号 id 只能是数字，收到 {token!r}")
+        ids.add(int(token))
+    if not ids:
+        raise ValueError("没有给出有效的账号 id")
+    return ids
+
+
 @app.route("/getValidAccounts",methods=['GET'])
-async def getValidAccounts():
+def getValidAccounts():
+    """校验账号登录态：`?id=3` 只校验一个，`?ids=1,3` 校验这几个，都不传就是全部。
+
+    **一个账号一个线程、同时跑**（见 `myUtils/auth.py::check_accounts`）：
+    整机同时开几个浏览器（默认 4）和"同一个账号不能同时开两个浏览器"由
+    `myUtils/browser_lock.py` 统一把关，所以总耗时约等于**最慢的那个账号**，
+    而不是所有账号之和。账号之间互不影响——一个平台卡住不会让别的账号没有结论。
+
+    「账号管理」页刷新时是**一个账号一条请求**（各更新各自那一行），
+    所以这里同时支持 `?id=`；不带参数的那条留给脚本和历史调用。
+
+    只下不发：**校验失败**才把 status 写成 0，通过不写 1（理由见
+    `myUtils/session_renew.py::_mark_invalid`）。被占用/出错而没校验成的账号
+    一律不碰它的状态——"没校验"不是"失效"，猜一个结论去写库是这里最不该做的事。
+    """
+    try:
+        wanted = _parse_account_ids(request.args)
+    except ValueError as exc:
+        return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
+
     with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
         cursor = conn.cursor()
         cursor.execute('''
         SELECT * FROM user_info''')
-        rows = cursor.fetchall()
-        rows_list = [list(row) for row in rows]
-        print("\n📋 当前数据表内容：")
-        for row in rows:
-            print(row)
-        for row in rows_list:
-            flag = await check_cookie(row[1],row[2])
-            if not flag:
-                row[4] = 0
-                cursor.execute('''
-                UPDATE user_info 
-                SET status = ? 
-                WHERE id = ?
-                ''', (0,row[0]))
-                conn.commit()
-                print("✅ 用户状态已更新")
-        for row in rows:
-            print(row)
-        return jsonify(
-                        {
-                            "code": 200,
-                            "msg": None,
-                            "data": rows_list
-                        }),200
+        rows_list = [list(row) for row in cursor.fetchall()]
+
+    if wanted is None:
+        selected = rows_list
+    else:
+        selected = [row for row in rows_list if int(row[0]) in wanted]
+        missing = sorted(wanted - {int(row[0]) for row in selected})
+        if missing:
+            return jsonify({
+                "code": 404,
+                "msg": f"账号不存在: {missing}",
+                "data": None
+            }), 404
+
+    accounts = [
+        {"id": row[0], "type": row[1], "file_path": row[2], "name": row[3]}
+        for row in selected
+    ]
+
+    print(f"\n🔐 校验 {len(accounts)} 个账号的登录态（各账号并发）：")
+    started = time.time()
+    results = check_accounts(accounts)
+    duration_ms = int((time.time() - started) * 1000)
+
+    invalid_ids = []
+    # 按 id 配对而不是靠 zip 的下标：错位的结果拿去改账号状态，比少改几个危险得多
+    # （会把「甲失效」写成「乙失效」，而这正是"骗用户去重新扫码"的那类错误）。
+    by_id = {result.get("id"): result for result in results}
+    for row in selected:
+        result = by_id.get(row[0]) or {}
+        icon = {
+            "ok": "✅",
+            "invalid": "⚠️",
+            "busy": "🕐",
+            "error": "❌",
+        }.get(result.get("status"), "•")
+        platform = session_renew.PLATFORM_NAMES.get(int(row[1] or 0), "未知平台")
+        print(f"  {icon} {platform}·{row[3]}：{result.get('message') or ''}")
+        if result.get("status") == "invalid":
+            row[4] = 0
+            invalid_ids.append(row[0])
+
+    if invalid_ids:
+        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+            conn.executemany(
+                "UPDATE user_info SET status = 0 WHERE id = ?",
+                [(account_id,) for account_id in invalid_ids],
+            )
+            conn.commit()
+        print(f"✅ 已把 {len(invalid_ids)} 个失效账号标为「异常」")
+
+    counts = {
+        key: sum(1 for result in results if result.get("status") == key)
+        for key in ("ok", "invalid", "busy", "error")
+    }
+    print(
+        f"🔐 校验结束（{duration_ms} ms）：有效 {counts['ok']}、失效 {counts['invalid']}、"
+        f"被占用没校验 {counts['busy']}、出错 {counts['error']}"
+    )
+
+    return jsonify(
+                    {
+                        "code": 200,
+                        "msg": None,
+                        "data": selected,
+                        # 校验的元信息：多少条有效 / 失效，以及"哪些压根没校验成"。
+                        # 前端靠它区分"这次没查到"和"确实失效了"，好给出诚实的提示。
+                        "verify": {
+                            "total": len(results),
+                            "ok": counts["ok"],
+                            "invalid": counts["invalid"],
+                            "busy": counts["busy"],
+                            "error": counts["error"],
+                            "duration_ms": duration_ms,
+                            "results": [
+                                {
+                                    "id": result.get("id"),
+                                    "name": result.get("name"),
+                                    "status": result.get("status"),
+                                    "message": result.get("message"),
+                                }
+                                for result in results
+                            ],
+                        },
+                    }),200
 
 @app.route('/deleteFile', methods=['GET'])
 def delete_file():

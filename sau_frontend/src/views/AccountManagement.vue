@@ -666,72 +666,130 @@ const fetchAccountsQuick = async () => {
   try {
     const res = await accountApi.getAccounts()
     if (res.code === 200 && res.data) {
-      // 将所有账号的状态暂时设为"验证中"
-      const accountsWithPendingStatus = res.data.map(account => {
-        const updatedAccount = [...account];
-        updatedAccount[4] = -1; // -1 表示验证中的临时状态
-        return updatedAccount;
-      });
-      accountStore.setAccounts(accountsWithPendingStatus);
-      resetAvatarCache();
+      // 照数据库里的状态显示。
+      // 这里**不再**统一标成「验证中」：这一步只是读一次数据库（毫秒级），并没有在跑
+      // 校验。标了的话进页面看到的就是"所有账号都在校验中"，而那个状态要等下面
+      // verifyOneAccount 一条条请求回来才会消失——账号多、平台慢的时候能挂好几分钟，
+      // 也就分不清"在查"还是"卡住了"。
+      accountStore.setAccounts(res.data)
+      resetAvatarCache()
     }
   } catch (error) {
     console.error('快速获取账号数据失败:', error)
   }
 }
 
-// 获取账号数据（带验证）
+// 校验**一个**账号：一个账号一条请求，谁先回来谁先更新那一行。
+//
+// 这就是"各账号单独验证"：后端给每个账号开一个线程 + 一个浏览器（整机同时开几个由
+// browser_lock 把关），账号之间互不影响。所以某个平台卡住（实测视频号那条要 29 秒）
+// 不会把其它账号的结论一起拖住，界面上是一行一行变绿的，不是等最后一个。
+//
+// 返回 { name, status } 给调用方汇总用；status 取 ok / invalid / busy / error，
+// 后两个是"这次没校验成"，和"确实失效"不是一回事。
+const verifyOneAccount = async (account) => {
+  let status = 'error'
+  try {
+    const res = await accountApi.getValidAccounts(account.id)
+    const row = res?.data?.[0]
+    status = res?.verify?.results?.[0]?.status || (res?.code === 200 ? 'ok' : 'error')
+    if (res?.code === 200 && row) {
+      // 回写后端刚给的状态（原始值，不是 '正常'/'异常'）：
+      // 校验失败的账号后端已经写成 0；被占用 / 出错而**没校验成**的账号库里还是原值，
+      // 界面就自然退回它原来的状态，不会永远停在「验证中」。
+      accountStore.setAccountStatus(account.id, row[4])
+      return { name: account.name, status }
+    }
+    accountStore.setAccountStatus(account.id, account.rawStatus)
+  } catch (error) {
+    console.error(`校验账号「${account.name}」失败:`, error)
+    accountStore.setAccountStatus(account.id, account.rawStatus)
+  }
+  return { name: account.name, status }
+}
+
+// 校验并刷新**一个**账号（目前只有"上传 Cookie"用：换的只是它一个账号的登录态）。
+//
+// 为什么不用 `fetchAccounts()`：那是"把每个账号各开一次浏览器校验一遍"，为了一个账号
+// 让其余账号陪着各转 20~30 秒毫无道理。
+//
+// **扫码登录成功不走这里**——那条路连一次校验都不做，见 refreshAccountsAfterLogin。
+//
+// 只碰这一行：其它行的状态一个字都不动（不会出现"全表一起转圈"）。
+const refreshOneAccount = async (row) => {
+  const rawStatus = row.status === '正常' ? 1 : 0
+  resetAvatarCache() // 换了 cookie，头像可能也跟着换一张
+  accountStore.setAccountStatus(row.id, -1) // -1 = 只把这一行标成「验证中」
+  return verifyOneAccount({ id: row.id, name: row.name, rawStatus })
+}
+
+// 「账号数据」（含头像）是后端**后台线程**同步的（myUtils/login.py::_schedule_account_sync，
+// 要开一次浏览器，十几秒到几十秒）。第一次读库时它多半还没写完，头像是 404 →
+// 前端会把这个账号记进 avatarMissing（见 avatarSrc），于是先显示文字头像；
+// 不再读一次的话，那个文字头像会一直挂到下一次刷新。
+// 所以过一会儿再读一次库（只是读库，不开浏览器、不做校验），头像到位就自动换上。
+const AVATAR_RECHECK_DELAY_MS = 20000
+
+// 扫码成功后刷新列表：**只读库，不校验**。
+//
+// 登录流程本身已经带着这个账号真的进过后台了，再开一个浏览器去"确认它有效"
+// 是把同一件事做第二遍（新账号 ~5 秒、视频号 ~30 秒）。而这一行该有的东西后端全写好了：
+// 账号行和登录态由 `_record_account` 落库（新账号 `INSERT status=1`、重新扫码 `UPDATE status=1`），
+// 账号数据由 `_schedule_account_sync` 同步——前端读库就是最新的。
+const refreshAccountsAfterLogin = async () => {
+  await fetchAccountsQuick()
+  // 标记为已访问（和点刷新那条路保持一致）
+  if (appStore.isFirstTimeAccountManagement) {
+    appStore.setAccountManagementVisited()
+  }
+  setTimeout(fetchAccountsQuick, AVATAR_RECHECK_DELAY_MS)
+}
+
+// 刷新：把每个账号各校验一次。
+//
+// **只有用户点右上角那个刷新按钮才会走到这里**——进页面不校验（见 onMounted），
+// 只动了一个账号的动作也不该走这里（见 refreshOneAccount）。
 const fetchAccounts = async () => {
   if (appStore.isAccountRefreshing) return
 
   appStore.setAccountRefreshing(true)
 
+  // 先记下每一行原来的状态：万一某条请求整个失败（后端没起来之类），要能退回它，
+  // 不能把账号永远留在「验证中」——那个状态除了这一轮没有别人会去清。
+  const snapshot = accountStore.accounts.map(account => ({
+    id: account.id,
+    name: account.name,
+    rawStatus: account.status === '正常' ? 1 : 0
+  }))
+  accountStore.markAllVerifying()
+
   try {
-    const res = await accountApi.getValidAccounts()
-    if (res.code === 200 && res.data) {
-      accountStore.setAccounts(res.data)
-      // 刷新一次就给所有账号一次机会：刚同步到头像的账号不该因为之前那次 404 一直显示文字头像
-      resetAvatarCache()
-      ElMessage.success('账号数据获取成功')
-      // 标记为已访问
-      if (appStore.isFirstTimeAccountManagement) {
-        appStore.setAccountManagementVisited()
-      }
+    const results = await Promise.all(snapshot.map(account => verifyOneAccount(account)))
+    // 刷新一次就给所有账号一次机会：刚同步到头像的账号不该因为之前那次 404 一直显示文字头像
+    resetAvatarCache()
+
+    const missed = results.filter(item => item.status === 'busy' || item.status === 'error')
+    if (missed.length) {
+      // 说清"没查成"而不是"失效了"：前者重试一次就好，后者得重新扫码，别混为一谈
+      ElMessage.warning(`这些账号这次没能校验：${missed.map(item => item.name).join('、')}`)
     } else {
-      ElMessage.error('获取账号数据失败')
+      ElMessage.success('账号数据获取成功')
     }
-  } catch (error) {
-    console.error('获取账号数据失败:', error)
-    ElMessage.error('获取账号数据失败')
+    // 标记为已访问
+    if (appStore.isFirstTimeAccountManagement) {
+      appStore.setAccountManagementVisited()
+    }
   } finally {
     appStore.setAccountRefreshing(false)
   }
 }
 
-// 后台验证所有账号（优化版本，使用setTimeout避免阻塞UI）
-const validateAllAccountsInBackground = async () => {
-  // 使用setTimeout将验证过程放在下一个事件循环，避免阻塞UI
-  setTimeout(async () => {
-    try {
-      const res = await accountApi.getValidAccounts()
-      if (res.code === 200 && res.data) {
-        accountStore.setAccounts(res.data)
-      }
-    } catch (error) {
-      console.error('后台验证账号失败:', error)
-    }
-  }, 0)
-}
-
 // 页面加载时获取账号数据
 onMounted(() => {
-  // 快速获取账号列表（不验证），立即显示
+  // 只读一次数据库，**不校验**。
+  // 校验要给每个账号开一次浏览器（一个账号十几秒到几十秒，还得跟平台真实交互），
+  // 进页面就跑等于每次打开这个页面都白等一轮。要查就点右上角那个刷新按钮。
   fetchAccountsQuick()
-
-  // 在后台验证所有账号
-  setTimeout(() => {
-    validateAllAccountsInBackground()
-  }, 100) // 稍微延迟一下，让用户看到快速加载的效果
 })
 
 // 获取平台标签类型
@@ -954,8 +1012,8 @@ const handleUploadCookie = (row) => {
       const result = await http.upload('/uploadCookie', formData)
 
       ElMessage.success('Cookie文件上传成功')
-      // 刷新账号列表以显示更新
-      fetchAccounts()
+      // 换的是**这一个**账号的登录态，就只校验它（别把所有账号都查一遍）
+      refreshOneAccount(row)
     } catch (error) {
       ElMessage.error('Cookie文件上传失败')
     } finally {
@@ -1094,7 +1152,7 @@ const connectSSE = (platform, name) => {
           // 关闭连接
           closeSSEConnection()
 
-          // 1秒后关闭对话框并开始刷新
+          // 1秒后关闭对话框并刷新列表
           setTimeout(() => {
             dialogVisible.value = false
             sseConnecting.value = false
@@ -1102,19 +1160,10 @@ const connectSSE = (platform, name) => {
             // 根据是否是重新登录显示不同提示
             ElMessage.success(dialogType.value === 'edit' ? '重新登录成功' : '账号添加成功')
 
-            // 显示更新账号信息提示
-            ElMessage({
-              type: 'info',
-              message: '正在同步账号信息...',
-              duration: 0
-            })
-
-            // 触发刷新操作
-            fetchAccounts().then(() => {
-              // 刷新完成后关闭提示
-              ElMessage.closeAll()
-              ElMessage.success('账号信息已更新')
-            })
+            // 只读一次库把列表刷新出来。**不校验**：登录刚证过它有效，
+            // 再开一次浏览器去确认是白等（新账号 ~5 秒、视频号 ~30 秒），
+            // 而状态和账号数据后端都已经写好了（见 refreshAccountsAfterLogin）。
+            refreshAccountsAfterLogin()
           }, 1000)
         }, 1000)
       } else {
@@ -1185,8 +1234,9 @@ const submitAccountForm = () => {
             accountStore.updateAccount(accountForm.id, updatedAccount)
             ElMessage.success('更新成功')
             dialogVisible.value = false
-            // 刷新账号列表
-            fetchAccounts()
+            // 这里**不刷新、也不校验**：改名只动了 userName 这一列，登录态一点没变，
+            // 上面那句 updateAccount 已经把界面改好了。原来这里调 fetchAccounts()，
+            // 等于"改个名字 → 所有账号各开一次浏览器"，纯属白等。
           } else {
             ElMessage.error(res.msg || '更新账号失败')
           }
