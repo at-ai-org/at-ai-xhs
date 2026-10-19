@@ -10,7 +10,7 @@
 const TOKEN_KEY = 'at-ai-xhs-token'
 const USERNAME_KEY = 'at-ai-xhs-username'
 
-// 后端签发时的有效期，仅用于本文件注释参考：7 天（TOKEN_MAX_AGE）。
+// 后端签发时的有效期，仅用于本文件注释参考：21 天（TOKEN_MAX_AGE）。
 // 前端不做过期判断，过期由后端返回 401、再由 request.js 统一处理。
 
 export function getToken() {

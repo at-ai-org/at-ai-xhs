@@ -58,8 +58,8 @@ USERNAME = "admin"
 PASSWORD_LENGTH = 16
 PASSWORD_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-#: token 有效期：7 天。本地工具，太短会烦人，太长又不好收拾。
-TOKEN_MAX_AGE = 7 * 24 * 3600
+#: token 有效期：21 天。本地工具，太短会烦人，太长又不好收拾。
+TOKEN_MAX_AGE = 21 * 24 * 3600
 
 _TOKEN_SALT = "at-ai-xhs-web-auth"
 
