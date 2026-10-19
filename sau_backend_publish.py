@@ -85,6 +85,7 @@ from flask import Blueprint, jsonify, request
 import myUtils.publish_progress as progress
 import myUtils.publish_prompt as prompts
 import myUtils.app_settings as settings
+import myUtils.publish_evidence as evidence
 from conf import BASE_DIR
 from myUtils import publish_records as records
 from myUtils.browser_lock import (
@@ -145,6 +146,19 @@ PUBLISH_STRATEGY: dict[int, tuple[str, str]] = {
     4: (KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE, KUAISHOU_PUBLISH_STRATEGY_SCHEDULED),
     5: (PDD_PUBLISH_STRATEGY_IMMEDIATE, PDD_PUBLISH_STRATEGY_SCHEDULED),
 }
+
+
+def _evidence_hint_of(platform: int) -> str:
+    """任务失败时附在结论后面的"现场截图见 screenshots/<平台>/"。
+
+    平台编号在库里是可信的，但这里仍然**查不到就不加**：结论里印一个不存在的目录
+    比不印更误导人。目录名（business）就是 `myUtils/publish_evidence.py` 用的那个，
+    两边由测试钉着不许漂。
+    """
+    business = (PLATFORMS.get(platform) or {}).get("business")
+    if business not in evidence.PLATFORM_DIRS:
+        return ""
+    return f"（现场截图见 {evidence.dir_hint(business)}）"
 
 # --------------------------------------------------------------------------- #
 # 状态与阶段
@@ -832,6 +846,10 @@ def _run_task(task_id: str, watchdog_signal: threading.Event | None = None) -> N
         steps = _json_safe(task.get("steps") or [])
         if steps:
             _update_task(task_id, steps=steps)
+        # 失败信息里带上现场目录：上传器在抛错前**一定会**往
+        # `screenshots/<平台>/` 落一张现场截图（见 myUtils/publish_evidence.py），
+        # 用户在最显眼的地方（任务结论）就能知道去哪儿看，不用翻日志猜。
+        reason += _evidence_hint_of(task["platform"])
         _finish_task(task_id, STATUS_FAILED, reason)
     finally:
         _disarm_watchdog(watchdog)
@@ -1203,10 +1221,60 @@ def publish_submit():
     except ValueError as exc:
         return jsonify({"code": 400, "msg": str(exc), "data": None}), 400
 
+    # 「跳过已发布素材」：发布中心默认勾着。按**平台**判——同一条素材发给同一个平台的
+    # 多个账号，只要这个平台上已经成功发过它，这条平台的任务就整个不建
+    # （判据见 myUtils/publish_records.find_published_materials）。
+    # 它是"建不建任务"的决定，所以放在提交这一层，不进 options、不落到每条任务上。
+    skipped: list[dict] = []
+    if body.get("skip_published"):
+        published = records.find_published_materials(
+            [draft["material"] for draft in drafts],
+            [draft["platform"] for draft in drafts],
+        )
+        if published:
+            keep: list[dict] = []
+            for draft in drafts:
+                info = published.get((draft["material"], int(draft["platform"])))
+                if info:
+                    skipped.append(
+                        {
+                            "material": draft["material"],
+                            "material_title": draft.get("material_title") or draft["material"],
+                            "platform": draft["platform"],
+                            "platform_name": draft.get("platform_name") or "",
+                            "account_name": draft.get("account_name") or "",
+                            "last_success_time": info.get("last_success_time") or "",
+                            "count": info.get("count") or 0,
+                        }
+                    )
+                else:
+                    keep.append(draft)
+            drafts = keep
+
+    # 全被跳过：没有任务可建，就别造一个空批次（前端据此提示"这批都发过了"）。
+    # 只可能是"跳着跳着没得发了"——素材/平台为空的提交，上面 `_build_tasks` 已经 ValueError。
+    if body.get("skip_published") and not drafts:
+        return jsonify(
+            {
+                "code": 200,
+                "msg": "这一批素材在对应平台都已经成功发布过，没有需要发布的任务",
+                "data": {
+                    "job_id": "",
+                    "task_count": 0,
+                    "tasks": [],
+                    "skipped": skipped,
+                    "skipped_count": len(skipped),
+                },
+            }
+        )
+
     job_id = uuid.uuid4().hex
     created = time.time()
     task_ids: list[str] = []
-    records: list[dict] = []
+    # 注意别叫 `records`：模块顶部 `from myUtils import publish_records as records`
+    # 就是这个名字，函数里再起一个同名的局部变量，整个函数体内的 `records.xxx`
+    # 都会变成 UnboundLocalError（上面那次「跳过已发布素材」的查询就踩过）。
+    record_rows: list[dict] = []
 
     # 同账号发过的素材（可能刚在前端确认过），给这些任务在日志里留一句。
     # 查的是提交这一刻的发布记录，跟着 `options.confirmRepublish` 一起决定措辞。
@@ -1249,7 +1317,7 @@ def publish_submit():
             _tasks[task_id] = task
             _waiting.setdefault(task["channel"], []).append(task_id)
         task_ids.append(task_id)
-        records.append(
+        record_rows.append(
             {
                 "task_id": task_id,
                 "record_id": task["record_id"],
@@ -1283,7 +1351,14 @@ def publish_submit():
         {
             "code": 200,
             "msg": f"已提交 {len(task_ids)} 个发布任务",
-            "data": {"job_id": job_id, "task_count": len(task_ids), "tasks": records},
+            "data": {
+                "job_id": job_id,
+                "task_count": len(task_ids),
+                "tasks": record_rows,
+                # 「跳过已发布素材」跳掉的那些，前端据此说清楚"为什么只发了 N 条"
+                "skipped": skipped,
+                "skipped_count": len(skipped),
+            },
         }
     )
 
@@ -1616,3 +1691,100 @@ def publish_record_detail(record_id: int):
     if row is None:
         return jsonify({"code": 404, "msg": "记录不存在", "data": None}), 404
     return jsonify({"code": 200, "msg": "ok", "data": records.record_row(row)})
+
+
+@publish_bp.get("/stats/overview")
+def publish_stats_overview():
+    """首页 Dashboard 的多维统计（只读 publish_records + file_records，一次拉全）。
+
+    维度：总量与成败、按平台、按账号、近 14 天趋势、来源占比、文案覆盖、素材总量。
+    数据全在 SQLite 里，一次查询毫秒级；分成多条小 SQL 是为了每个维度各自兜底——
+    一个维度缺表/缺列不该让整块统计都 500。
+    """
+    out: dict = {"totals": {}, "by_platform": [], "by_account": [], "by_day": [], "by_source": []}
+
+    def q(sql: str, params: tuple = ()):  # 单条查询 + 兜底
+        try:
+            with records.db() as conn:
+                return conn.execute(sql, params).fetchall()
+        except Exception as exc:
+            print(f"⚠️ 首页统计查询失败（不影响其它维度）: {exc}")
+            return []
+
+    rows = q(
+        "SELECT platform, platform_name, status, COUNT(*) AS n FROM publish_records GROUP BY platform, status"
+    )
+    platform_map: dict[int, dict] = {}
+    for r in rows:
+        key = int(r["platform"])
+        item = platform_map.setdefault(
+            key,
+            {"platform": key, "name": r["platform_name"] or f"平台{key}", "total": 0, "success": 0, "failed": 0},
+        )
+        item["total"] += r["n"]
+        if r["status"] == "success":
+            item["success"] += r["n"]
+        elif r["status"] == "failed":
+            item["failed"] += r["n"]
+    out["by_platform"] = sorted(platform_map.values(), key=lambda x: -x["total"])
+
+    for r in q(
+        """
+        SELECT platform_name, account_name, COUNT(*) AS total,
+               SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+               MAX(finished_at) AS last_at
+          FROM publish_records
+         WHERE account_name IS NOT NULL AND account_name != ''
+         GROUP BY platform_name, account_name
+         ORDER BY total DESC LIMIT 8
+        """
+    ):
+        out["by_account"].append(
+            {"platform": r["platform_name"], "name": r["account_name"], "total": r["total"],
+             "success": r["success"] or 0, "last_at": r["last_at"] or ""}
+        )
+
+    for r in q(
+        """
+        SELECT substr(created_at, 1, 10) AS day,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+          FROM publish_records
+         WHERE created_at >= date('now', 'localtime', '-13 days')
+         GROUP BY day ORDER BY day
+        """
+    ):
+        out["by_day"].append({"day": r["day"], "total": r["total"], "success": r["success"] or 0, "failed": r["failed"] or 0})
+
+    for r in q(
+        """
+        SELECT COALESCE(NULLIF(source, ''), 'publish_center') AS src, COUNT(*) AS n
+          FROM publish_records GROUP BY src
+        """
+    ):
+        out["by_source"].append(
+            {"source": r["src"], "label": records.SOURCE_TEXT.get(r["src"], r["src"]), "count": r["n"]}
+        )
+
+    totals = {"total": 0, "success": 0, "failed": 0}
+    for r in q("SELECT status, COUNT(*) AS n FROM publish_records GROUP BY status"):
+        totals["total"] += r["n"]
+        if r["status"] == "success":
+            totals["success"] += r["n"]
+        elif r["status"] == "failed":
+            totals["failed"] += r["n"]
+    # 素材：总量 + 已带 AI 文案的量（material_copy 有 desc 就算带上）
+    try:
+        with records.db() as conn:
+            totals["materials"] = conn.execute("SELECT COUNT(*) AS n FROM file_records").fetchone()["n"]
+            totals["materials_with_copy"] = conn.execute(
+                "SELECT COUNT(*) AS n FROM material_copy WHERE desc IS NOT NULL AND desc != ''"
+            ).fetchone()["n"]
+    except Exception as exc:
+        print(f"⚠️ 首页统计（素材维度）失败: {exc}")
+        totals["materials"] = 0
+        totals["materials_with_copy"] = 0
+    out["totals"] = totals
+
+    return jsonify({"code": 200, "msg": "ok", "data": out})

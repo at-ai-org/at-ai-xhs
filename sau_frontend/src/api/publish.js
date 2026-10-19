@@ -101,6 +101,14 @@ export const publishApi = {
   },
 
   /**
+   * 首页 Dashboard 的多维统计：总量与成败、按平台、按账号、近 14 天趋势、
+   * 来源占比、素材与文案覆盖。只读，一次拉全。
+   */
+  statsOverview() {
+    return http.get('/publish/stats/overview')
+  },
+
+  /**
    * 当前所有「发布途中在等人输入」的请求（抖音短信验证码…）。
    * 刻意做成全局接口：验证码等的是坐在电脑前的人，跟用户停在哪个页面无关，
    * 所以由布局层 App.vue 轮询它来弹窗。

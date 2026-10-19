@@ -36,16 +36,24 @@
         description="点右上角「从素材库选择」，或直接上传本地视频。选中后会按素材自带的 AI 文案自动带出标题、正文和话题。"
       />
 
-      <!-- 已选素材：每条可单独改文案 -->
-      <div v-for="(item, idx) in items" :key="item.name" class="item-card">
-        <div class="item-head">
-          <div class="item-title">
-            <el-tag size="small" type="info">素材 {{ idx + 1 }}</el-tag>
-            <span class="name">{{ item.name }}</span>
-            <span class="meta">{{ item.sizeText }} · {{ item.mtimeText }}</span>
-          </div>
-          <div>
-            <el-tag v-if="item.hasCopy" size="small" type="success" effect="plain">已带出 AI 文案</el-tag>
+      <!-- 已选素材：每条可单独改文案。素材多的时候整页全是表单，选完只想核对平台/账号，
+           所以每条素材折成一栏（标题：素材名 · 文案状态），点开才编辑 -->
+      <el-collapse v-model="expandedItems" class="item-collapse">
+        <el-collapse-item v-for="(item, idx) in items" :key="item.name" :name="item.name">
+          <template #title>
+            <div class="item-head">
+              <div class="item-title">
+                <el-tag size="small" type="info">素材 {{ idx + 1 }}</el-tag>
+                <span class="name">{{ item.name }}</span>
+                <span class="meta">{{ item.sizeText }} · {{ item.mtimeText }}</span>
+              </div>
+              <el-tag v-if="item.hasCopy" size="small" type="success" effect="plain">已带出文案</el-tag>
+              <el-tag v-else size="small" type="warning" effect="plain">文案待补</el-tag>
+            </div>
+          </template>
+
+          <!-- 操作按钮放在面板内容顶部：折叠栏里只留状态标签，标题一行的信息密度不挤 -->
+          <div class="item-toolbar">
             <el-button
               size="small"
               type="primary"
@@ -57,27 +65,27 @@
             </el-button>
             <el-button size="small" type="danger" plain @click="removeItem(idx)">移除</el-button>
           </div>
-        </div>
 
-        <el-form label-width="64px" class="item-form">
-          <el-form-item label="标题">
-            <el-input v-model="item.title" maxlength="20" show-word-limit placeholder="不超过 20 字" />
-          </el-form-item>
-          <el-form-item label="正文">
-            <el-input
-              v-model="item.desc"
-              type="textarea"
-              :rows="4"
-              maxlength="1000"
-              show-word-limit
-              placeholder="留空也可以，各平台受限不同"
-            />
-          </el-form-item>
-          <el-form-item label="话题">
-            <el-input v-model="item.tagsText" placeholder="逗号分隔，不带 # 号" />
-          </el-form-item>
-        </el-form>
-      </div>
+          <el-form label-width="64px" class="item-form">
+            <el-form-item label="标题">
+              <el-input v-model="item.title" maxlength="20" show-word-limit placeholder="不超过 20 字" />
+            </el-form-item>
+            <el-form-item label="正文">
+              <el-input
+                v-model="item.desc"
+                type="textarea"
+                :rows="4"
+                maxlength="1000"
+                show-word-limit
+                placeholder="留空也可以，各平台受限不同"
+              />
+            </el-form-item>
+            <el-form-item label="话题">
+              <el-input v-model="item.tagsText" placeholder="逗号分隔，不带 # 号" />
+            </el-form-item>
+          </el-form>
+        </el-collapse-item>
+      </el-collapse>
     </el-card>
 
     <!-- ② 平台与账号 -->
@@ -140,6 +148,13 @@
       <div class="option-row">
         <el-checkbox v-model="isOriginal">声明原创</el-checkbox>
         <span class="hint ml8">仅在内容确实原创时勾选</span>
+      </div>
+      <div class="option-row">
+        <el-checkbox v-model="skipPublished">跳过已发布过的素材</el-checkbox>
+        <span class="hint ml8">
+          按<strong>平台</strong>判：这条素材在某个平台已经发成功过，就不再往那个平台发
+          （同平台的多个账号一起跳过），别的平台照发；取消勾选则全部照发。
+        </span>
       </div>
       <div class="option-row">
         <el-checkbox v-model="scheduleEnabled">定时发布</el-checkbox>
@@ -340,7 +355,9 @@
         ref="materialTableRef"
         :data="filteredMaterials"
         height="420"
+        class="material-pick-table"
         @selection-change="onMaterialSelectionChange"
+        @row-click="onMaterialRowClick"
       >
         <el-table-column type="selection" width="46" />
         <el-table-column prop="name" label="素材" show-overflow-tooltip min-width="220" />
@@ -427,6 +444,9 @@ const uploading = ref(false)
 
 // 待发布项：每个素材一份文案
 const items = ref([])
+// 展开编辑文案的素材（按素材名）。选完素材默认全折叠——一次选十来条时全展开表单
+// 根本看不过来，要点哪条改文案再点开哪条。
+const expandedItems = ref([])
 
 // 平台级提示语：发布中心里跟在平台名下面显示。
 // 目前只有小红书一条（用户要求）：它的风控最严，建议改走「小红书工作台」的有头模式。
@@ -445,6 +465,10 @@ const platformAccounts = reactive(
 
 const isOriginal = ref(false)
 const isDraft = ref(false)
+// 跳过"在对应平台已经发成功过"的素材（默认勾上）。
+// 素材发完还留在发布列表里是很常见的，再点一次「开始发布」就会在平台上多出一条重复内容；
+// 判据在后端按**平台**算（同平台有任一账号发成功过就算发过），见 publish_records.find_published_materials。
+const skipPublished = ref(true)
 const scheduleEnabled = ref(false)
 const videosPerDay = ref(1)
 const dailyTimes = ref(['10:00'])
@@ -604,6 +628,17 @@ function onMaterialSelectionChange(rows) {
   pendingMaterials.value = rows
 }
 
+/**
+ * 点整行 = 勾选/取消勾选这条素材（不用非得瞄准那个小方框）。
+ *
+ * 勾选框那一格要**跳过去**：点它时勾选框自己已经把状态翻了，这里再 toggle 一次
+ * 正好抵消，表现就是"点勾选框没反应"。`column.type === 'selection'` 就是那一格。
+ */
+function onMaterialRowClick(row, column) {
+  if (column?.type === 'selection') return
+  materialTableRef.value?.toggleRowSelection(row)
+}
+
 function confirmMaterials() {
   if (!pendingMaterials.value.length) {
     ElMessage.warning('请先勾选素材')
@@ -622,6 +657,8 @@ function confirmMaterials() {
       hasCopy: !!m.has_copy,
       analyzing: false
     })
+    // 新加进来的素材：有文案的直接折叠（不用看），没文案的展开提醒补
+    if (!m.has_copy) expandedItems.value.push(m.name)
   }
   materialDialogVisible.value = false
   pendingMaterials.value = []
@@ -716,6 +753,9 @@ function buildPayload(confirmedRepeat = false) {
   return {
     items: publishItems(),
     targets: publishTargets(),
+    // 放在顶层而不是 options 里：它是"建不建这条任务"的决定，不是发布方式，
+    // 不该跟着任务落到上传器那边去（见 sau_backend_publish.publish_submit）。
+    skip_published: skipPublished.value,
     options: {
       isOriginal: isOriginal.value,
       isDraft: isDraft.value,
@@ -780,8 +820,13 @@ async function doPublish() {
     // 先问一次"这些素材这个账号是不是发过了"：发重了平台上就是两条重复内容，
     // 得让用户明确知道再发（确认结果会跟着 options.confirmRepublish 一起提交）
     const check = await fetchRepeatCheck()
-    if (check?.conflicts?.length) {
-      repeatConflicts.value = check.conflicts
+    let conflicts = check?.conflicts || []
+    // 勾着「跳过已发布过的素材」时，"已经发成功过"的那些任务后端根本不会建，
+    // 再弹窗问"这个账号发过了，还要发吗"就是白问一次——只留"还在路上"的那种冲突
+    // （在飞的不算"已发布成功"，不会被跳过，确实值得提醒）。
+    if (skipPublished.value) conflicts = conflicts.filter((c) => !c.published)
+    if (conflicts.length) {
+      repeatConflicts.value = conflicts
       repeatTaskCount.value = check.task_count || 0
       repeatDialogVisible.value = true
       return
@@ -808,9 +853,26 @@ async function submitPublish(confirmedRepeat) {
   try {
     const res = await publishApi.submit(buildPayload(confirmedRepeat))
     if (res.code !== 200) return
-    jobId.value = res.data.job_id
+    const data = res.data || {}
+    const skipped = data.skipped || []
+
+    // 全被跳过：后端没建批次（job_id 为空），别去轮询一个不存在的批次
+    if (!data.task_count) {
+      ElMessage.info(res.msg || '这一批素材在对应平台都已经发布过，没有需要发布的任务')
+      return
+    }
+
+    jobId.value = data.job_id
     details.value = {}
     ElMessage.success(res.msg || '已提交发布任务')
+    if (skipped.length) {
+      // 说清楚"为什么条数比你数出来的少"，否则用户会以为是漏发了
+      const where = [...new Set(skipped.map((s) => s.platform_name).filter(Boolean))].join('、')
+      ElMessage.info(
+        `已跳过 ${skipped.length} 条任务：${where || '对应平台'}上这些素材已经成功发布过` +
+          `（不想跳过就取消勾选「跳过已发布过的素材」）`
+      )
+    }
     await refreshJob()
     startPolling()
   } catch (e) {
@@ -980,6 +1042,19 @@ onBeforeUnmount(stopPolling)
 </script>
 
 <style scoped>
+/* 素材选择表：整行可点（点一下 = 勾选这条素材），所以行要给"能点"的样子，
+   否则用户不知道除了小方框还能点别处 */
+.material-pick-table {
+  :deep(.el-table__row) {
+    cursor: pointer;
+  }
+
+  /* 勾选框那一格点上去就是翻勾选，指针别跟着变成"点击整行"的样子 */
+  :deep(.el-table__row .el-table-column--selection) {
+    cursor: default;
+  }
+}
+
 .publish-center {
   max-width: 1100px;
 }
@@ -1030,24 +1105,48 @@ onBeforeUnmount(stopPolling)
   color: #909399;
   font-size: 12px;
 }
-.item-card {
-  border: 1px solid #ebeef5;
-  border-radius: 6px;
-  padding: 12px 14px;
-  margin-bottom: 12px;
-  background: #fafcff;
+.item-collapse {
+  border-top: none;
+}
+.item-collapse :deep(.el-collapse-item__header) {
+  height: auto;
+  min-height: 48px;
+  padding: 8px 0;
+  line-height: 24px;
+  align-items: center;
+}
+.item-collapse :deep(.el-collapse-item__content) {
+  padding-bottom: 8px;
 }
 .item-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 10px;
+  flex: 1;
+  margin-right: 12px;
   gap: 12px;
   flex-wrap: wrap;
+}
+.item-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.item-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  min-width: 0;
 }
 .item-title .name {
   font-weight: 600;
   margin: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
 }
 .item-title .meta {
   color: #909399;
@@ -1055,6 +1154,7 @@ onBeforeUnmount(stopPolling)
 }
 .item-form {
   margin-bottom: -8px;
+  padding: 4px 8px 0;
 }
 .platform-row {
   padding: 10px 12px;

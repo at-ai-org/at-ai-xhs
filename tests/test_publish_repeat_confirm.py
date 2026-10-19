@@ -421,6 +421,185 @@ class SubmitRepeatNoteTest(RepeatTestBase):
         self.assertEqual(notes["新的.mp4"], [])
 
 
+class SkipPublishedTest(RepeatTestBase):
+    """「跳过已发布素材」：发布中心那个默认勾着的选项（`skip_published`）。
+
+    和上面那个二次确认是**两件事**，别混：
+
+    * 二次确认问的是"**这个账号**发过没有"，只提示、不拦；
+    * 这个选项问的是"**这个平台**上成功发过没有"，答"发过"就**根本不建这条任务**。
+
+    要钉住的几条：
+    1. 按**平台**判：同一条素材发给同一个平台的多个账号，只要有一个账号发成功过，
+       这个平台整个跳过（不是只跳那一个账号）；
+    2. 别的平台不受影响——素材在快手发过，不妨碍它发抖音；
+    3. 只有 `success` 算数：失败/取消/中断过的重发是正常的；
+    4. 素材改名前后都认得出来（和二次确认同一套放宽口径）；
+    5. 选项没传（老前端、CLI）时行为完全不变——不能因为加了个开关就把别人带崩。
+    """
+
+    def setUp(self):
+        super().setUp()
+        app = Flask(__name__)
+        app.register_blueprint(BP.publish_bp)
+        self.client = app.test_client()
+
+        # 基类只造了两个 type=1（小红书）的账号；「别的平台不受影响」那条要用抖音账号，
+        # 否则提交会被"账号不属于这个平台"挡成 400。
+        with records.db() as conn:
+            conn.execute(
+                "INSERT INTO user_info (id, userName, type, filePath) VALUES (3, '抖音账号', 3, 'c.json')"
+            )
+
+        self._saved = {
+            "tasks": dict(BP._tasks),
+            "jobs": dict(BP._jobs),
+            "waiting": {k: list(v) for k, v in BP._waiting.items()},
+            "queues": dict(BP._queues),
+        }
+        BP._tasks.clear()
+        BP._jobs.clear()
+        BP._waiting.clear()
+        BP._queues = __import__("collections").defaultdict(queue.Queue)
+        self._patches = [patch.object(BP, "_ensure_worker", lambda channel: None)]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        BP._tasks.clear()
+        BP._tasks.update(self._saved["tasks"])
+        BP._jobs.clear()
+        BP._jobs.update(self._saved["jobs"])
+        BP._waiting.clear()
+        BP._waiting.update(self._saved["waiting"])
+        BP._queues = self._saved["queues"]
+        super().tearDown()
+
+    def submit(self, materials, targets, *, skip=None):
+        payload = {
+            "items": [{"material": name, "title": f"{name} 的标题"} for name in materials],
+            "targets": [{"platform": p, "account_ids": list(ids)} for p, ids in targets],
+            "options": {},
+        }
+        if skip is not None:
+            payload["skip_published"] = skip
+        res = self.client.post("/publish/submit", json=payload)
+        self.assertEqual(res.status_code, 200)
+        return res.get_json()["data"]
+
+    def created(self, data):
+        """实际建出来的任务：`{素材: {平台}}`。"""
+        out: dict[str, set] = {}
+        if not data.get("job_id"):
+            return out
+        with BP._lock:
+            for task_id in BP._jobs[data["job_id"]]["task_ids"]:
+                task = BP._tasks[task_id]
+                out.setdefault(task["material"], set()).add(int(task["platform"]))
+        return out
+
+    # ---- 1. 按平台跳过 ---- #
+    def test_published_material_is_skipped_on_that_platform(self):
+        self.record("demo.mp4", platform=1)
+
+        data = self.submit(["demo.mp4"], [(1, [1])], skip=True)
+
+        self.assertEqual(data["task_count"], 0)
+        self.assertEqual(data["skipped_count"], 1)
+        self.assertEqual(data["skipped"][0]["material"], "demo.mp4")
+        self.assertEqual(data["skipped"][0]["platform"], 1)
+        self.assertEqual(self.created(data), {})
+
+    def test_skip_covers_every_account_on_that_platform(self):
+        """只要这个平台上有一个账号发成功过，整个平台跳过（不是只跳那个账号）。"""
+        self.record("demo.mp4", platform=1, account_id=2, account_name="账号B")
+
+        data = self.submit(["demo.mp4"], [(1, [1, 2])], skip=True)
+
+        self.assertEqual(data["task_count"], 0)
+        # 2 个账号 → 2 条任务都被跳过
+        self.assertEqual(data["skipped_count"], 2)
+
+    def test_other_platforms_still_publish(self):
+        self.record("demo.mp4", platform=1)
+
+        data = self.submit(["demo.mp4"], [(1, [1]), (3, [3])], skip=True)
+
+        self.assertEqual(data["task_count"], 1)
+        self.assertEqual(self.created(data), {"demo.mp4": {3}})
+        self.assertEqual([s["platform"] for s in data["skipped"]], [1])
+
+    def test_unpublished_material_in_the_same_batch_still_publishes(self):
+        self.record("发过的.mp4", platform=1)
+
+        data = self.submit(["发过的.mp4", "新的.mp4"], [(1, [1])], skip=True)
+
+        self.assertEqual(self.created(data), {"新的.mp4": {1}})
+        self.assertEqual(data["skipped_count"], 1)
+
+    # ---- 2. 只有 success 算数 ---- #
+    def test_failed_or_interrupted_records_do_not_skip(self):
+        self.record("demo.mp4", platform=1, status=records.STATUS_FAILED)
+        self.record("demo.mp4", platform=1, status=records.STATUS_CANCELLED)
+        self.record("demo.mp4", platform=1, status=records.STATUS_INTERRUPTED)
+
+        data = self.submit(["demo.mp4"], [(1, [1])], skip=True)
+
+        self.assertEqual(data["task_count"], 1)
+        self.assertEqual(data["skipped_count"], 0)
+
+    def test_in_flight_records_do_not_skip(self):
+        """在飞的不算"已发布成功"：这一批刚提交完再点一次，不该把自己当成重复。"""
+        self.record("demo.mp4", platform=1, status=records.STATUS_RUNNING)
+
+        data = self.submit(["demo.mp4"], [(1, [1])], skip=True)
+
+        self.assertEqual(data["task_count"], 1)
+        self.assertEqual(data["skipped_count"], 0)
+
+    # ---- 3. 改名 ---- #
+    def test_matches_after_material_was_renamed(self):
+        """素材生成 AI 文案时会被改名，记录里存的是发布当时的名字。"""
+        self.record("uuid-1234_海边日落.mp4", material_title="海边日落.mp4", platform=1)
+
+        data = self.submit(["海边日落.mp4"], [(1, [1])], skip=True)
+
+        self.assertEqual(data["task_count"], 0)
+        self.assertEqual(data["skipped_count"], 1)
+
+    # ---- 4. 不传 / 传 false 时行为不变 ---- #
+    def test_option_absent_keeps_old_behaviour(self):
+        self.record("demo.mp4", platform=1)
+
+        data = self.submit(["demo.mp4"], [(1, [1])])
+
+        self.assertEqual(data["task_count"], 1)
+        self.assertEqual(data["skipped_count"], 0)
+
+    def test_option_false_publishes_everything(self):
+        """取消勾选 = 全部照发（用户明确要重发时就是这么用）。"""
+        self.record("demo.mp4", platform=1)
+
+        data = self.submit(["demo.mp4"], [(1, [1])], skip=False)
+
+        self.assertEqual(data["task_count"], 1)
+        self.assertEqual(data["skipped_count"], 0)
+
+    # ---- 5. 整批全被跳过 ---- #
+    def test_all_skipped_creates_no_job(self):
+        """全跳过时不建空批次：前端据此提示"这批都发过了"，而不是开一个永远空的进度页。"""
+        self.record("demo.mp4", platform=1)
+
+        data = self.submit(["demo.mp4"], [(1, [1])], skip=True)
+
+        self.assertEqual(data["job_id"], "")
+        self.assertEqual(data["task_count"], 0)
+        self.assertEqual(data["tasks"], [])
+        self.assertEqual(data["skipped_count"], 1)
+
+
 class CheckPublishedQueryTest(unittest.TestCase):
     """查不动的时候要**明确失败**，不能假装"没有重复"。
 

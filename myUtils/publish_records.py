@@ -508,6 +508,79 @@ def find_repeat_publishes(targets: list[dict], materials: list[str]) -> list[dic
     return result
 
 
+def find_published_materials(
+    materials: list[str], platforms: list[int]
+) -> dict[tuple[str, int], dict]:
+    """这批素材**在每个平台上**成功发过没有——**不看账号**。
+
+    和 `find_repeat_publishes` 是两件事，别混：
+
+    * 那个问的是"**这个账号**发过这条没有"，答错了就是同一个账号里多一条重复内容，
+      所以只提示、不拦截；
+    * 这个问的是"**这个平台**上已经发成功过这条没有"——发布中心的「跳过已发布素材」
+      按它决定要不要**建这条任务**。同一条素材发给同一个平台的多个账号，
+      只要有一个账号发成功过，这个平台就算发过了。
+
+    匹配口径和 `find_repeat_publishes` 一样**故意放宽**（`material` 和 `material_title`
+    都算），理由也一样：素材生成 AI 文案时会被改名，只认当前名字的话，
+    改名之后这条素材在记录里就"查无此人"，于是会被重新发一遍——而这恰恰是最容易
+    重复发布的情形。只有 `success` 算数：失败/取消/中断过的重发是正常的。
+
+    返回 `{(素材名, 平台): {"platform", "material", "count", "last_success_time"}}`，
+    键用的是**传进来的素材名**（不是记录里那个可能已经过期的名字）。
+    """
+    names: list[str] = []
+    for name in materials or []:
+        text = str(name or "").strip()
+        if text and text not in names:
+            names.append(text)
+    plats: list[int] = []
+    for value in platforms or []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number and number not in plats:
+            plats.append(number)
+    if not names or not plats:
+        return {}
+
+    name_slots = ",".join("?" * len(names))
+    plat_slots = ",".join("?" * len(plats))
+    statuses = sorted(PUBLISHED_STATUSES)
+    status_slots = ",".join("?" * len(statuses))
+
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT platform, material, material_title, created_at FROM publish_records "
+            f"WHERE platform IN ({plat_slots}) AND status IN ({status_slots}) "
+            f"AND (material IN ({name_slots}) OR material_title IN ({name_slots}))",
+            (*plats, *statuses, *names, *names),
+        ).fetchall()
+
+    found: dict[tuple[str, int], dict] = {}
+    for row in rows:
+        platform = int(row["platform"] or 0)
+        hit_names = {str(row["material"] or ""), str(row["material_title"] or "")}
+        for name in names:
+            if name not in hit_names:
+                continue
+            entry = found.setdefault(
+                (name, platform),
+                {
+                    "material": name,
+                    "platform": platform,
+                    "count": 0,
+                    "last_success_time": "",
+                },
+            )
+            entry["count"] += 1
+            when = str(row["created_at"] or "")
+            if when > entry["last_success_time"]:
+                entry["last_success_time"] = when
+    return found
+
+
 # 建表放在 import 时做：后端启动即完成，免得第一次发完才发现表不存在。
 # 这里只建 schema、不动业务数据；把残留任务标成"已中断"是破坏性写入，
 # 由服务进程启动时显式调用 mark_orphan_records_interrupted()，不能挂在这里。
