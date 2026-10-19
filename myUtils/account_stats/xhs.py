@@ -212,7 +212,8 @@ async def _prepare_page(context):
             timeout=45000,
         )
     except Exception as exc:
-        raise AccountStatsError(f"打不开小红书创作服务平台：{exc}") from exc
+        # 同 kuaishou.py：打不开页面是网络瞬断，归「这次没拿到」而不是硬错误
+        raise StatsUnavailable(f"打不开小红书创作服务平台：{exc}") from exc
 
     # 等 `_webmsxyw` 出现。它由页面自己的 JS 注入，`domcontentloaded` 时通常还没好。
     try:

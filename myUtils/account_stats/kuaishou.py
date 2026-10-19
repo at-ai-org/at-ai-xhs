@@ -200,7 +200,11 @@ async def _capture(page, timeout: float) -> dict[str, dict[str, Any]]:
             "https://cp.kuaishou.com/profile", wait_until="domcontentloaded", timeout=45000
         )
     except Exception as exc:
-        raise AccountStatsError(f"打不开快手创作者服务平台：{exc}") from exc
+        # **打不开页面 ≠ 抓取出错**：`net::ERR_CONNECTION_CLOSED` / 超时这类是网络瞬断
+        # （发布中心同时在跑、机器被压住时最常见），账号和登录态都是好的。
+        # 按 `pdd.py` 里写明的约定，这种情况归 `StatsUnavailable`——弹窗提示"这次没拿到、
+        # 显示的是上次的数据"，而不是甩一条红色报错让人以为账号坏了。
+        raise StatsUnavailable(f"打不开快手创作者服务平台：{exc}") from exc
 
     # 等全部到齐；缺的那些**不算失败**，交给调用方按"哪段没有"处理。
     await asyncio.wait(futures.values(), timeout=timeout)

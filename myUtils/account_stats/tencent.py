@@ -547,7 +547,8 @@ async def _fetch_async(
                     _PAGE_URL, wait_until="domcontentloaded", timeout=int(_PAGE_READY_TIMEOUT * 1000)
                 )
             except Exception as exc:
-                raise AccountStatsError(f"打不开视频号助手：{exc}") from exc
+                # 同 kuaishou.py：打不开页面是网络瞬断，归「这次没拿到」而不是硬错误
+                raise StatsUnavailable(f"打不开视频号助手：{exc}") from exc
 
             await page.wait_for_timeout(3000)
 
