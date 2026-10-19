@@ -17,6 +17,33 @@ def strip_literals(expr):
     return expr
 
 
+def prop_names(script):
+    """defineProps 声明的 prop 名。
+
+    它是编译宏、不是普通变量，所以上面那几条正则看不见它；不认的话，任何带 props 的
+    组件都会被误报成"模板引用了未定义的 xxx"（Sparkline、SessionRenewToggle 这些老组件
+    一直是这样）。两种写法都认：对象式 defineProps({ a: {...} }) 和数组式 defineProps(['a'])。
+    """
+    names = set()
+    m = re.search(r'defineProps\s*\(\s*\{', script)
+    if m:
+        # 括号配平找出对象字面量的范围，再只看第 0 层的 key（嵌套的是 prop 的配置，不是 prop）
+        depth, i = 1, m.end()
+        while i < len(script) and depth:
+            depth += {'{': 1, '}': -1}.get(script[i], 0)
+            i += 1
+        for line in script[m.end():i - 1].splitlines():
+            stripped = line.strip()
+            if depth == 0:
+                km = re.match(r'(\w+)\s*:', stripped)
+                if km:
+                    names.add(km.group(1))
+            depth += stripped.count('{') - stripped.count('}')
+    for arr in re.findall(r'defineProps\s*\(\s*\[([^\]]*)\]', script):
+        names |= {x.strip().strip('\'"') for x in arr.split(',') if x.strip()}
+    return names
+
+
 def check(path):
     src = Path(path).read_text(encoding='utf-8')
     tpl = src[src.index('<template>'):src.rindex('</template>')]
@@ -27,6 +54,7 @@ def check(path):
     for grp in re.findall(r'import\s+\{([^}]*)\}', script):
         defined |= {x.strip().split(' as ')[-1].strip() for x in grp.split(',') if x.strip()}
     defined |= set(re.findall(r'import\s+(\w+)\s+from', script))
+    defined |= prop_names(script)
 
     # v-for 引入的循环变量
     for m in re.findall(r'v-for="\(?([^")]*)\)?\s+in\s+', tpl):

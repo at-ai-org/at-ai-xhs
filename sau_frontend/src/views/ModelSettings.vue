@@ -2,6 +2,7 @@
   <div class="settings-page">
     <div class="page-header">
       <h1>设置</h1>
+      <span class="hint">视觉模型、发布默认值、账号续期都在这里配置</span>
     </div>
 
     <el-card shadow="never" class="mb16">
@@ -23,49 +24,52 @@
         description="只要服务实现了 OpenAI 的 /chat/completions 接口就能用——官方 OpenAI、各类中转、通义/豆包等兼容层、vLLM、Ollama 都行。模型必须是多模态（能读图）的。"
       />
 
-      <el-form label-width="130px" class="mt16">
-        <el-form-item label="服务地址">
-          <el-input
-            v-model="form.base_url"
-            placeholder="https://api.openai.com/v1"
-            style="max-width: 520px"
-          />
-          <div class="hint">填到 /v1 这一层即可，程序会自动拼 /chat/completions</div>
-        </el-form-item>
+      <el-form label-width="130px" class="mt16 settings-form">
+        <!-- 连接三要素：并排两列，免得三个长输入框把页面拉得老长 -->
+        <div class="form-grid">
+          <el-form-item label="服务地址" class="is-important">
+            <el-input v-model="form.base_url" placeholder="https://api.openai.com/v1" />
+            <div class="hint">填到 /v1 这一层即可，程序会自动拼 /chat/completions</div>
+          </el-form-item>
 
-        <el-form-item label="API Key">
-          <el-input
-            v-model="form.api_key"
-            type="password"
-            show-password
-            :placeholder="form.has_key ? `已保存（${form.api_key_masked}），留空表示不修改` : 'sk-...'"
-            style="max-width: 520px"
-          />
-          <div class="hint">明文保存在本机 settings.json（权限 600），接口只回传掩码</div>
-        </el-form-item>
+          <el-form-item label="API Key" class="is-important">
+            <el-input
+              v-model="form.api_key"
+              type="password"
+              show-password
+              :placeholder="form.has_key ? `已保存（${form.api_key_masked}），留空表示不修改` : 'sk-...'"
+            />
+            <div class="hint">明文保存在本机 settings.json（权限 600），接口只回传掩码</div>
+          </el-form-item>
 
-        <el-form-item label="模型名">
-          <el-input v-model="form.model" placeholder="gpt-4o-mini / qwen-vl-max / doubao-1.5-vision-pro" style="max-width: 520px" />
-        </el-form-item>
+          <el-form-item label="模型名" class="is-important">
+            <el-input v-model="form.model" placeholder="gpt-4o-mini / qwen-vl-max / doubao-1.5-vision-pro" />
+            <div class="hint">必须是能读图的多模态模型</div>
+          </el-form-item>
 
-        <el-form-item label="超时（秒）">
-          <el-input-number v-model="form.timeout" :min="10" :max="600" :step="10" />
-        </el-form-item>
+          <el-form-item label="超时（秒）">
+            <el-input-number v-model="form.timeout" :min="10" :max="600" :step="10" class="w-full" />
+            <div class="hint">生成一次文案最多等多久</div>
+          </el-form-item>
+        </div>
 
-        <el-form-item label="最大输出长度">
-          <el-input-number v-model="form.max_tokens" :min="500" :max="32000" :step="500" />
-          <div class="hint">
-            推理模型（会输出思考过程的）思考也占这个额度：设太小会导致正文被截断、话题标签丢失。
-            建议 8000 起步，出现"话题为空"就往上调。
-          </div>
-        </el-form-item>
+        <el-divider content-position="left">生成参数</el-divider>
 
-        <el-form-item label="正文字数上限">
-          <el-input-number v-model="form.desc_max_chars" :min="30" :max="1000" :step="10" />
-          <div class="hint">
-            生成正文的字数上限（小红书正文本身可到 1000 字，这里是主动收窄）。默认 100 字。
-          </div>
-        </el-form-item>
+        <div class="form-grid">
+          <el-form-item label="最大输出长度" class="is-important">
+            <el-input-number v-model="form.max_tokens" :min="500" :max="32000" :step="500" class="w-full" />
+            <div class="hint">
+              推理模型的思考也占这个额度：太小会截断正文。建议 8000 起步。
+            </div>
+          </el-form-item>
+
+          <el-form-item label="正文字数上限" class="is-important">
+            <el-input-number v-model="form.desc_max_chars" :min="30" :max="1000" :step="10" class="w-full" />
+            <div class="hint">
+              生成正文的字数上限（小红书正文可到 1000 字，这里是主动收窄）
+            </div>
+          </el-form-item>
+        </div>
 
         <el-form-item label="额外要求">
           <el-input
@@ -73,7 +77,6 @@
             type="textarea"
             :rows="3"
             placeholder="可留空。例如：语气活泼一点，面向 25-35 岁女性，突出性价比"
-            style="max-width: 640px"
           />
           <div class="hint">会追加到生成文案的提示词里</div>
         </el-form-item>
@@ -92,31 +95,31 @@
 
     <el-card shadow="never">
       <template #header><span>发布默认值</span></template>
-      <el-form label-width="130px">
-        <el-form-item label="默认合集">
-          <el-input v-model="defaultCollection" placeholder="例如 风景" style="max-width: 320px" />
-          <div class="hint">发布页会自动选中的合集名；留空则不自动选。找不到同名合集会保持不选。</div>
-        </el-form-item>
-        <el-form-item label="视频号视频标注">
-          <el-select v-model="tencentContentLabel" placeholder="不标注（默认）" style="max-width: 320px">
-            <el-option label="不标注（默认，实拍视频用这个）" value="" />
-            <el-option label="含AI生成内容" value="含AI生成内容" />
-          </el-select>
-          <div class="hint">
-            视频号发布页的「视频标注」。默认不设置——实拍视频没有 AI 生成内容，平台也不强制，
-            硬去点这一项只会白等一次超时。成片确实含 AI 生成内容（TTS 配音 / AI 画面）时再选上。
-          </div>
-        </el-form-item>
-        <el-form-item label="抖音自主声明">
-          <el-select v-model="douyinDeclaration" placeholder="不声明（默认）" style="max-width: 320px">
-            <el-option label="不声明（默认，实拍视频用这个）" value="" />
-            <el-option label="内容由AI生成" value="内容由AI生成" />
-          </el-select>
-          <div class="hint">
-            抖音发布页的「自主声明」。默认什么都不声明——实拍视频没有 AI 生成内容，平台也不强制。
-            成片确实含 AI 生成内容（TTS 配音 / AI 字幕 / AI 画面）时才需要选上。
-          </div>
-        </el-form-item>
+      <el-form label-width="130px" class="settings-form">
+        <div class="form-grid">
+          <el-form-item label="默认合集" class="is-important">
+            <el-input v-model="defaultCollection" placeholder="例如 风景" />
+            <div class="hint">发布页会自动选中的合集名；留空则不自动选。找不到同名合集会保持不选。</div>
+          </el-form-item>
+          <el-form-item label="视频号视频标注" class="is-important">
+            <el-select v-model="tencentContentLabel" placeholder="不标注（默认）" class="w-full">
+              <el-option label="不标注（默认，实拍视频用这个）" value="" />
+              <el-option label="含AI生成内容" value="含AI生成内容" />
+            </el-select>
+            <div class="hint">
+              实拍视频用默认即可；成片含 AI 生成内容（TTS 配音 / AI 画面）时再选。
+            </div>
+          </el-form-item>
+          <el-form-item label="抖音自主声明" class="is-important">
+            <el-select v-model="douyinDeclaration" placeholder="不声明（默认）" class="w-full">
+              <el-option label="不声明（默认，实拍视频用这个）" value="" />
+              <el-option label="内容由AI生成" value="内容由AI生成" />
+            </el-select>
+            <div class="hint">
+              默认不声明；成片确实含 AI 生成内容（TTS 配音 / AI 字幕 / AI 画面）时才需要选。
+            </div>
+          </el-form-item>
+        </div>
       </el-form>
     </el-card>
   </div>
@@ -227,16 +230,29 @@ onMounted(load)
 </script>
 
 <style scoped>
+/* 不设 max-width：和素材管理/账号管理等页一样占满主区域，
+   右侧不会留一大截空白（原来 1000px 限制在宽屏上右边的空白很扎眼） */
 .settings-page {
-  max-width: 900px;
+  min-width: 0;
 }
 .page-header {
   margin-bottom: 20px;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
 }
 .page-header h1 {
-  font-size: 24px;
+  font-size: 22px;
   color: var(--el-text-color-primary);
   margin: 0;
+}
+.hint {
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.page-header .hint {
+  font-size: 13px;
 }
 .mb16 {
   margin-bottom: 16px;
@@ -249,9 +265,36 @@ onMounted(load)
   justify-content: space-between;
   align-items: center;
 }
-.hint {
+
+/* 表单主体：两列网格。窄屏自动退回单列（媒体查询在 scoped 里正常生效） */
+.settings-form .form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 24px;
+}
+@media (max-width: 900px) {
+  .settings-form .form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.settings-form :deep(.el-form-item__content) {
+  flex-direction: column;
+  align-items: stretch;
+}
+.w-full {
+  width: 100%;
+}
+/* 重要参数：标签加粗加黑，扫一眼就能看到关键项 */
+.settings-form :deep(.is-important > .el-form-item__label) {
+  font-weight: 700;
+  color: var(--el-text-color-primary);
+}
+.settings-form :deep(.el-divider--horizontal) {
+  margin: 20px 0 4px;
+}
+.settings-form :deep(.el-divider__text) {
+  font-size: 13px;
   color: #909399;
-  font-size: 12px;
-  line-height: 1.6;
+  font-weight: 600;
 }
 </style>
