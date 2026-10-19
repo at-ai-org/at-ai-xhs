@@ -16,6 +16,50 @@
         />
         <div class="action-buttons">
           <el-button type="primary" @click="handleUploadMaterial">上传素材</el-button>
+          <!--
+            批量按钮和「上传素材」并排：勾了素材就能点，一条没勾就置灰——
+            所以中间那句"已选 N 项"要一直显示，它就是按钮为什么灰着的原因。
+            勾选跨页保留（见 el-table 的 reserve-selection），
+            不写清楚的话翻到第二页会以为刚才勾的掉了。
+          -->
+          <span class="selected-hint" :class="{ 'is-empty': !selectedRows.length }">
+            已选 {{ selectedRows.length }} 项
+            <el-tooltip
+              v-if="selectedRows.length"
+              content="翻页后仍保留，批量会一次处理全部选中项"
+              placement="top"
+            >
+              <el-icon class="selected-hint-icon"><QuestionFilled /></el-icon>
+            </el-tooltip>
+          </span>
+          <el-button
+            type="success"
+            plain
+            :disabled="!selectedRows.length || batchBusy"
+            @click="openBatchCopyDialog"
+          >
+            批量生成文案
+          </el-button>
+          <!-- 只选了图片时这个按钮也是灰的，鼠标悬停要能问出原因：
+               置灰的 el-button 自己不派发鼠标事件，所以外面套一层 span 来挂 tooltip -->
+          <el-tooltip
+            :disabled="!selectedRows.length || selectedVideoRows.length > 0"
+            content="选中的素材里没有视频——换音轨只对视频有效"
+            placement="top"
+          >
+            <span class="batch-btn-tip">
+              <el-button
+                type="warning"
+                plain
+                :disabled="!selectedRows.length || !selectedVideoRows.length || batchBusy"
+                @click="openBatchBgmDialog"
+              >
+                批量合成背景音乐
+              </el-button>
+            </span>
+          </el-tooltip>
+          <!-- 有勾选才有意义，所以只在选了素材时出现（没选时它本来也没得清） -->
+          <el-button v-if="selectedRows.length" text @click="clearSelection">清除选择</el-button>
           <el-button type="info" @click="handleRefresh" :loading="isRefreshing">
             <el-icon v-if="!isRefreshing"><Refresh /></el-icon>
             <span v-if="isRefreshing">刷新中</span>
@@ -24,7 +68,18 @@
       </div>
       
       <div class="material-list">
-        <el-table :data="pagedMaterials" style="width: 100%">
+        <!-- row-key + reserve-selection：翻页后勾选不丢（按 id 跟着行）
+             ref 只为了操作完能 clearSelection -->
+        <el-table
+          ref="materialTableRef"
+          :data="pagedMaterials"
+          row-key="id"
+          style="width: 100%"
+          class="material-select-table"
+          @selection-change="handleSelectionChange"
+          @row-click="onMaterialRowClick"
+        >
+          <el-table-column type="selection" :reserve-selection="true" width="46" />
           <el-table-column prop="filename" label="文件名" min-width="240" show-overflow-tooltip />
           <el-table-column prop="filesize" label="文件大小" width="110">
             <template #default="scope">
@@ -94,8 +149,8 @@
 
         <el-pagination
           v-if="filteredMaterials.length > 0"
-          class="material-pagination"
-          layout="total, sizes, prev, pager, next, jumper"
+          class="pager"
+          layout="total, sizes, prev, pager, next"
           :total="filteredMaterials.length"
           :current-page="currentPage"
           :page-size="pageSize"
@@ -180,14 +235,21 @@
     >
       <div class="preview-container" v-loading="previewLoading" v-if="currentMaterial">
         <div v-if="isVideoFile(currentMaterial)" class="video-preview">
+          <!--
+            src 直接挂在 <video> 上，**不要**用 <source> 子元素：
+            资源加载失败时 error 事件打在 <source> 上、不会冒泡到 <video>，
+            于是 @error 永远不触发——界面就只剩一个转不完的圈，一句提示都没有。
+            顺带也去掉了写死的 type="video/mp4"（.mov/.webm 素材本来就不是 mp4，
+            类型交给响应头的 Content-Type 判断更靠谱）。
+          -->
           <video
             controls
             preload="metadata"
+            :src="getPreviewUrl(currentMaterial.file_path)"
             style="max-width: 100%; max-height: 60vh;"
             @loadeddata="onMediaLoaded"
             @error="onMediaError"
           >
-            <source :src="getPreviewUrl(currentMaterial.file_path)" type="video/mp4">
             您的浏览器不支持视频播放
           </video>
         </div>
@@ -259,7 +321,7 @@
               <span class="bgm-option-meta">{{ formatDuration(item.duration) }}</span>
             </el-option>
           </el-select>
-          <el-button :disabled="!bgmMusicId" @click="toggleMusicPreview">
+          <el-button :disabled="!bgmMusicId" @click="toggleMusicPreview(bgmMusicId, 'single')">
             {{ previewingMusicId === bgmMusicId ? '停止' : '试听' }}
           </el-button>
         </div>
@@ -293,6 +355,161 @@
           <el-button :disabled="isComposing" @click="bgmDialogVisible = false">关闭</el-button>
           <el-button v-if="isComposing" type="danger" plain @click="cancelCompose">中断合成</el-button>
           <el-button v-else type="primary" :disabled="!bgmMusicId" @click="startCompose">
+            开始合成
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
+
+    <!-- 批量生成文案对话框 -->
+    <el-dialog
+      v-model="batchCopyDialogVisible"
+      title="批量生成文案"
+      width="620px"
+      :top="'8vh'"
+      :close-on-click-modal="false"
+      :close-on-press-escape="!batchCopyRunning"
+      :show-close="!batchCopyRunning"
+    >
+      <div class="batch-run">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="逐条生成，同一时间只跑一条"
+          description="每条都会抽首尾帧交给模型；生成完素材会被改名成标题，已有文案会被覆盖。图片素材同样支持。"
+        />
+
+        <div class="batch-opts">
+          <el-checkbox v-model="batchCopySkipExisting" :disabled="batchCopyRunning">
+            跳过已有 AI 文案的素材
+          </el-checkbox>
+          <span class="batch-opts-hint">
+            共 {{ batchCopyItems.length }} 条，其中已有文案 {{ batchCopyExistingCount }} 条
+          </span>
+        </div>
+
+        <!-- 批次总进度：跑完之前不显示 100%，和单条合成一个口径 -->
+        <el-progress
+          v-if="batchCopyStarted"
+          class="batch-bar"
+          :percentage="batchCopyPercent"
+          :status="batchCopyProgressStatus"
+          :stroke-width="16"
+          :text-inside="true"
+        />
+
+        <BatchTaskList :items="batchCopyItems" empty-text="没有选中素材" />
+      </div>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button :disabled="batchCopyRunning" @click="batchCopyDialogVisible = false">
+            {{ batchCopyFinished ? '关闭' : '取消' }}
+          </el-button>
+          <el-button v-if="batchCopyRunning" type="danger" plain @click="cancelBatchCopy">
+            中断
+          </el-button>
+          <el-button
+            v-else-if="!batchCopyStarted"
+            type="primary"
+            :disabled="!batchCopyItems.length"
+            @click="startBatchCopy"
+          >
+            开始生成
+          </el-button>
+          <el-button
+            v-else
+            type="primary"
+            :disabled="!batchCopyItems.length"
+            @click="startBatchCopy"
+          >
+            重新生成这一批
+          </el-button>
+        </div>
+      </template>
+    </el-dialog>
+
+    <!-- 批量合成背景音乐对话框 -->
+    <el-dialog
+      v-model="batchBgmDialogVisible"
+      title="批量合成背景音乐"
+      width="620px"
+      :top="'8vh'"
+      :close-on-click-modal="false"
+      :close-on-press-escape="!batchBgmRunning"
+      :show-close="!batchBgmRunning"
+    >
+      <div class="batch-run">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="逐条把原音轨换成选中的音乐"
+          description="同时最多合成 2 条（每条一个 ffmpeg，再多会把机器压满）。成品文件名变成「原名-音乐名」，原文件被替换；非视频素材自动跳过。"
+        />
+
+        <div class="bgm-picker">
+          <el-select
+            v-model="batchBgmMusicId"
+            placeholder="选择背景音乐"
+            filterable
+            clearable
+            :loading="isLoadingMusic"
+            :disabled="batchBgmRunning"
+            class="bgm-select"
+          >
+            <el-option v-for="item in musicList" :key="item.id" :label="item.name" :value="item.id">
+              <span>{{ item.name }}</span>
+              <span class="bgm-option-meta">{{ formatDuration(item.duration) }}</span>
+            </el-option>
+          </el-select>
+          <el-button :disabled="!batchBgmMusicId" @click="toggleMusicPreview(batchBgmMusicId, 'batch')">
+            {{ previewingMusicId === batchBgmMusicId ? '停止' : '试听' }}
+          </el-button>
+        </div>
+
+        <div v-if="!isLoadingMusic && !musicList.length" class="bgm-hint">
+          还没有背景音乐，先去
+          <el-link type="primary" :underline="false" @click="goMusicPage">背景音乐</el-link>
+          页上传。
+        </div>
+
+        <!-- 试听共用一个 audio（和单个合成那个弹窗同一个做法，两个弹窗不会同时开） -->
+        <audio ref="batchBgmAudioRef" preload="none" style="display: none" @ended="stopMusicPreview" @error="stopMusicPreview" />
+
+        <div class="batch-opts">
+          <span class="batch-opts-hint">
+            共 {{ batchBgmItems.length }} 条，其中视频 {{ batchBgmVideoCount }} 条，图片/其他 {{ batchBgmItems.length - batchBgmVideoCount }} 条
+          </span>
+        </div>
+
+        <el-progress
+          v-if="batchBgmStarted"
+          class="batch-bar"
+          :percentage="batchBgmPercent"
+          :status="batchBgmProgressStatus"
+          :stroke-width="16"
+          :text-inside="true"
+        />
+
+        <BatchTaskList :items="batchBgmItems" empty-text="没有选中素材" />
+      </div>
+
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button :disabled="batchBgmRunning" @click="batchBgmDialogVisible = false">
+            {{ batchBgmFinished ? '关闭' : '取消' }}
+          </el-button>
+          <el-button v-if="batchBgmRunning" type="danger" plain @click="cancelBatchBgm">
+            中断合成
+          </el-button>
+          <el-button
+            v-else-if="!batchBgmStarted"
+            type="primary"
+            :disabled="!batchBgmMusicId || !batchBgmVideoCount"
+            @click="startBatchBgm"
+          >
             开始合成
           </el-button>
         </div>
@@ -355,13 +572,14 @@
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
-import { Refresh, Upload } from '@element-plus/icons-vue'
+import { QuestionFilled, Refresh, Upload } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { materialApi } from '@/api/material'
 import { musicApi } from '@/api/music'
 import { xhsApi } from '@/api/xhs'
 import { useAppStore } from '@/stores/app'
+import BatchTaskList from '@/components/BatchTaskList.vue'
 
 // 获取应用状态管理
 const appStore = useAppStore()
@@ -388,6 +606,10 @@ const copyDialogVisible = ref(false)
 const copyMaterial = ref(null)
 // 正在生成文案的素材：{ [磁盘文件名]: true }，用来给按钮单独转圈
 const generatingCopy = ref({})
+
+// 列表多选（批量生成文案 / 批量合成背景音乐），表格 ref 只为了能 clearSelection
+const materialTableRef = ref(null)
+const selectedRows = ref([])
 
 // 文件上传
 const fileList = ref([])
@@ -672,8 +894,6 @@ const fetchMusicList = async () => {
     const res = await musicApi.list()
     if (res.code === 200) {
       musicList.value = res.data || []
-      // 只有一首就默认选上，省一次点击
-      if (musicList.value.length === 1) bgmMusicId.value = musicList.value[0].id
     }
   } catch (error) {
     /* 拦截器已提示 */
@@ -682,6 +902,9 @@ const fetchMusicList = async () => {
   }
 }
 
+/** 只有一首就默认选上，省一次点击（单个合成和批量合成共用同一个口径）。 */
+const defaultMusicId = () => (musicList.value.length === 1 ? musicList.value[0].id : null)
+
 const openBgmDialog = async (material) => {
   bgmMaterial.value = material
   bgmMusicId.value = null
@@ -689,6 +912,7 @@ const openBgmDialog = async (material) => {
   bgmDialogVisible.value = true
   stopMusicPreview()
   await fetchMusicList()
+  bgmMusicId.value = defaultMusicId()
 }
 
 const onBgmDialogClosed = () => {
@@ -697,27 +921,37 @@ const onBgmDialogClosed = () => {
   bgmMaterial.value = null
 }
 
+// 两个弹窗共用一套试听状态：同时只会开一个，没必要分成两份
 const stopMusicPreview = () => {
-  const el = bgmAudioRef.value
-  if (el) {
-    el.pause()
-    el.removeAttribute('src')
-    el.load()
+  for (const audioRef of [bgmAudioRef, batchBgmAudioRef]) {
+    const el = audioRef.value
+    if (el) {
+      el.pause()
+      el.removeAttribute('src')
+      el.load()
+    }
   }
   previewingMusicId.value = null
 }
 
-const toggleMusicPreview = () => {
-  if (!bgmMusicId.value) return
-  if (previewingMusicId.value === bgmMusicId.value) {
+/**
+ * 试听。`target` 说明是哪个弹窗里的播放器（单个合成 / 批量合成各有一个 `<audio>`）。
+ *
+ * ⚠️ 这里传的是**名字**而不是 ref 本身：模板里的 `ref` 会被 Vue 自动解包成 DOM 元素，
+ * 传 `toggleMusicPreview(id, bgmAudioRef)` 拿到的是元素、`.value` 是 undefined，
+ * 表现就是"点了没反应"（`tools/verify_bgm_page.py` 的试听检查就是这么抓出来的）。
+ */
+const toggleMusicPreview = (musicId, target = 'single') => {
+  if (!musicId) return
+  if (previewingMusicId.value === musicId) {
     stopMusicPreview()
     return
   }
-  const el = bgmAudioRef.value
+  const el = (target === 'batch' ? batchBgmAudioRef : bgmAudioRef).value
   if (!el) return
   stopMusicPreview()
-  el.src = musicApi.fileUrl(bgmMusicId.value)
-  previewingMusicId.value = bgmMusicId.value
+  el.src = musicApi.fileUrl(musicId)
+  previewingMusicId.value = musicId
   const played = el.play()
   if (played && typeof played.catch === 'function') {
     played.catch(() => {
@@ -729,6 +963,7 @@ const toggleMusicPreview = () => {
 
 const goMusicPage = () => {
   bgmDialogVisible.value = false
+  batchBgmDialogVisible.value = false
   router.push('/background-music')
 }
 
@@ -822,6 +1057,456 @@ const cancelCompose = async () => {
   } catch (error) {
     /* 任务已经结束：让它自然收敛，不用额外提示 */
   }
+}
+
+// --------------------------------------------------------------------------- //
+// 批量操作（列表多选 → 批量生成文案 / 批量合成背景音乐）
+//
+// 后端没有"批量"接口，这里就是把 N 个单条请求排好队跑一遍——好处是进度、失败原因、
+// 中断都能一条一条看清楚，也不用为了前端的一个按钮去动后端。两条链路节奏不同：
+//   * 生成文案**必须串行**：每条都要抽首尾帧再调一次视觉模型，并发既压不住模型侧的
+//     限流，用户在弹窗里也看不出到底跑到哪条了；
+//   * 合成背景音乐**可以并发**：每条是一个独立的 ffmpeg 进程，但也不能全放开，
+//     固定最多 2 条同时在合成，跑完一条再起下一条（见 runBatchBgmWorker）。
+//
+// 两个批次的进度都收在弹窗里，所以请求一律带 `{ silent: true }`——不让拦截器
+// 为每一条失败弹一个 toast，否则 20 条失败就是 20 个提示糊在屏幕上。
+// --------------------------------------------------------------------------- //
+
+const BATCH_COMPOSE_CONCURRENCY = 2
+const BATCH_POLL_MS = 800
+// 后端 SAU_BGM_COMPOSE_TIMEOUT（默认 1800 秒）到点会掐掉 ffmpeg，这里留一点余量兜底：
+// 后端中途重启的话任务会永远查不到，不能让弹窗一直转圈。
+const BATCH_COMPOSE_TIMEOUT_MS = 31 * 60 * 1000
+
+// 组件销毁后循环要收尾退出。**不能**把它当成"中断合成"：人离开页面不等于不要那几条
+// 已经提交给后端的 ffmpeg（那条合成结果下一次回到列表还能从状态列里看到）。
+let batchPageDisposed = false
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// ---- 多选 ------------------------------------------------------------------
+
+const handleSelectionChange = (rows) => {
+  selectedRows.value = rows || []
+}
+
+/**
+ * 点整行 = 勾选/取消勾选这条素材（和发布中心素材选择弹窗同一套交互）。
+ *
+ * 勾选框那一格要**跳过去**：点它时勾选框自己已经把状态翻了，这里再 toggle 一次
+ * 正好抵消，表现就是"点勾选框没反应"。`column.type === 'selection'` 就是那一格。
+ */
+const onMaterialRowClick = (row, column) => {
+  if (column?.type === 'selection') return
+  materialTableRef.value?.toggleRowSelection(row)
+}
+
+/**
+ * 清空勾选。
+ * 批次跑起来之前一定要清：生成文案和合成背景音乐都会**改素材文件名**，
+ * 留着旧的勾选，用户再点一次批量就是拿一批已经不存在的老名字去请求。
+ */
+const clearSelection = () => {
+  materialTableRef.value?.clearSelection()
+  selectedRows.value = []
+}
+
+const selectedVideoRows = computed(() => selectedRows.value.filter(isVideoFile))
+
+/** 批次总数里已经"有结果"的条数（成功/失败/跳过都算），两条链路的百分比共用。 */
+const settledCount = (items) =>
+  items.filter((item) => item.state !== 'pending' && item.state !== 'running').length
+
+const batchPercent = (items, running, finished) => {
+  if (!items.length) return 0
+  if (finished && !running) return 100
+  // 跑完之前不显示 100%：完成是后端说的，不是进度条凑到的
+  return Math.min(99, Math.round((settledCount(items) / items.length) * 100))
+}
+
+/** 批次结束后进度条的收尾色：有失败就是红的。 */
+const batchStatus = (items, running, finished) => {
+  if (running || !finished) return undefined
+  return items.some((item) => item.state === 'failed') ? 'exception' : 'success'
+}
+
+const summarizeBatch = (title, items, okCount, failCount) => {
+  const skipCount = items.filter((item) => item.state === 'skipped').length
+  const parts = [`成功 ${okCount} 条`]
+  if (failCount) parts.push(`失败 ${failCount} 条`)
+  if (skipCount) parts.push(`跳过 ${skipCount} 条`)
+  const text = `${title}结束：${parts.join('，')}`
+  if (failCount) ElMessage.warning(text)
+  else ElMessage.success(text)
+}
+
+// ---- 批量生成文案 -----------------------------------------------------------
+
+const batchCopyDialogVisible = ref(false)
+const batchCopyItems = ref([])
+const batchCopyRunning = ref(false)
+const batchCopyStarted = ref(false)
+const batchCopyFinished = ref(false)
+const batchCopyCancelRequested = ref(false)
+const batchCopySkipExisting = ref(true)
+
+const batchCopyExistingCount = computed(
+  () => batchCopyItems.value.filter((item) => item.hasCopy).length
+)
+
+const batchCopyPercent = computed(() =>
+  batchPercent(batchCopyItems.value, batchCopyRunning.value, batchCopyFinished.value)
+)
+
+const batchCopyProgressStatus = computed(() =>
+  batchStatus(batchCopyItems.value, batchCopyRunning.value, batchCopyFinished.value)
+)
+
+/**
+ * 就地改这一行，不整表重拉。
+ * 批量里每条都会改名，几十条素材重拉几十次 /getFiles 太重；
+ * 而改名后 file_path / filename 必须跟着换，否则这一行还指着旧文件，
+ * 预览、删除、再次生成都会找不到（和单条那套"整表重拉"是同一个目的）。
+ */
+const retargetMaterialRow = (oldDisk, newDisk, copy) => {
+  const row = appStore.materials.find((m) => diskNameOf(m) === oldDisk)
+  if (!row) return null
+  if (newDisk && newDisk !== oldDisk) {
+    const dir = String(row.file_path || '').split('/').slice(0, -1).join('/')
+    row.file_path = dir ? `${dir}/${newDisk}` : newDisk
+    // 展示名要带扩展名（和后端 sync_file_record 的口径一致）：
+    // 不带后缀会被判成"未知类型"，预览就只剩一行文件信息、没有播放器
+    row.filename = newDisk
+  }
+  applyCopyToRow(row, copy)
+  return row
+}
+
+/** 把"还没跑的条目"在「等待中 / 已跳过」之间切一下，让用户点开始之前就看清楚会跑几条。 */
+const syncBatchCopyPlan = () => {
+  // 已经开跑（或跑过一轮）就不再改：那会儿的状态是真实结果，不是计划
+  if (batchCopyStarted.value) return
+  for (const item of batchCopyItems.value) {
+    if (item.hasCopy && batchCopySkipExisting.value) {
+      item.state = 'skipped'
+      item.message = '已有 AI 文案，按设置跳过'
+    } else {
+      item.state = 'pending'
+      item.message = ''
+    }
+  }
+}
+
+watch(batchCopySkipExisting, syncBatchCopyPlan)
+
+const openBatchCopyDialog = () => {
+  const rows = [...selectedRows.value]
+  if (!rows.length) return
+  batchCopyItems.value = rows.map((row) => ({
+    key: row.id,
+    disk: diskNameOf(row),
+    name: row.filename,
+    hasCopy: !!row.has_copy,
+    state: 'pending',
+    message: '',
+    progress: 0,
+  }))
+  batchCopyStarted.value = false
+  batchCopyFinished.value = false
+  batchCopyCancelRequested.value = false
+  batchCopySkipExisting.value = true
+  syncBatchCopyPlan()
+  batchCopyDialogVisible.value = true
+}
+
+const startBatchCopy = async () => {
+  if (batchCopyRunning.value || !batchCopyItems.value.length) return
+
+  batchCopyRunning.value = true
+  batchCopyStarted.value = true
+  batchCopyFinished.value = false
+  batchCopyCancelRequested.value = false
+  clearSelection()
+
+  // 每条先回到起点（「重新生成这一批」会再走一遍这里）
+  for (const item of batchCopyItems.value) {
+    item.progress = 0
+    item.message = ''
+    if (batchCopySkipExisting.value && item.hasCopy) {
+      item.state = 'skipped'
+      item.message = '已有 AI 文案，按设置跳过'
+    } else {
+      item.state = 'pending'
+    }
+  }
+
+  let okCount = 0
+  let failCount = 0
+
+  for (const item of batchCopyItems.value) {
+    if (batchPageDisposed) break
+    if (item.state === 'skipped') continue
+    if (batchCopyCancelRequested.value) {
+      item.state = 'skipped'
+      item.message = '已中断，未执行'
+      continue
+    }
+    if (!item.disk) {
+      item.state = 'failed'
+      item.message = '这条素材没有文件名'
+      failCount += 1
+      continue
+    }
+
+    item.state = 'running'
+    item.message = '正在抽帧并生成…'
+    try {
+      const res = await xhsApi.analyze(item.disk, '', true, { silent: true })
+      const data = res.data || {}
+      item.state = 'done'
+      item.progress = 100
+      item.hasCopy = true
+      item.message = data.title || ''
+      retargetMaterialRow(item.disk, data.video_name, data)
+      // 后端改名后这一条要跟着换名字，「重新生成这一批」才不会指向旧文件
+      if (data.video_name) {
+        item.disk = data.video_name
+        item.name = data.video_name
+      }
+      okCount += 1
+    } catch (error) {
+      item.state = 'failed'
+      item.message = error?.message || '生成失败'
+      failCount += 1
+    }
+  }
+
+  batchCopyRunning.value = false
+  batchCopyFinished.value = true
+  // 页面已经走了就不用再收尾：素材列表下次进这一页会重新拉，提示也没人看
+  if (batchPageDisposed) return
+  // 改名和新文案要落到列表上，收尾统一拉一次（中途都是就地改行）
+  await fetchMaterials(true)
+  summarizeBatch('批量生成文案', batchCopyItems.value, okCount, failCount)
+}
+
+const cancelBatchCopy = () => {
+  if (!batchCopyRunning.value) return
+  batchCopyCancelRequested.value = true
+  // 生成本身是同步接口，已经开始的那条停不下来，只能等它出结果
+  ElMessage.info('当前这条生成完就停')
+}
+
+// ---- 批量合成背景音乐 -------------------------------------------------------
+
+const batchBgmDialogVisible = ref(false)
+const batchBgmItems = ref([])
+const batchBgmMusicId = ref(null)
+const batchBgmRunning = ref(false)
+const batchBgmStarted = ref(false)
+const batchBgmFinished = ref(false)
+const batchBgmCancelRequested = ref(false)
+const batchBgmAudioRef = ref(null)
+
+const batchBgmVideoCount = computed(
+  () => batchBgmItems.value.filter((item) => item.isVideo).length
+)
+
+const batchBgmPercent = computed(() =>
+  batchPercent(batchBgmItems.value, batchBgmRunning.value, batchBgmFinished.value)
+)
+
+const batchBgmProgressStatus = computed(() =>
+  batchStatus(batchBgmItems.value, batchBgmRunning.value, batchBgmFinished.value)
+)
+
+// 同一时间只开一个批次：两个弹窗一起跑，机器受不了，用户也看不过来
+const batchBusy = computed(() => batchCopyRunning.value || batchBgmRunning.value)
+
+const openBatchBgmDialog = async () => {
+  const rows = [...selectedRows.value]
+  if (!rows.length) return
+  batchBgmItems.value = rows.map((row) => ({
+    key: row.id,
+    disk: diskNameOf(row),
+    name: row.filename,
+    isVideo: isVideoFile(row),
+    state: 'pending',
+    message: '',
+    progress: 0,
+  }))
+  batchBgmMusicId.value = null
+  batchBgmStarted.value = false
+  batchBgmFinished.value = false
+  batchBgmCancelRequested.value = false
+  batchBgmDialogVisible.value = true
+  stopMusicPreview()
+  await fetchMusicList()
+  batchBgmMusicId.value = defaultMusicId()
+}
+
+const startBatchBgm = async () => {
+  const musicId = batchBgmMusicId.value
+  if (!musicId || batchBgmRunning.value) return
+
+  batchBgmRunning.value = true
+  batchBgmStarted.value = true
+  batchBgmFinished.value = false
+  batchBgmCancelRequested.value = false
+  stopMusicPreview()
+  clearSelection()
+
+  // 只有视频能换音轨，图片/其他当场标成跳过，不进队列
+  const queue = []
+  for (const item of batchBgmItems.value) {
+    item.progress = 0
+    item.message = ''
+    if (item.isVideo) {
+      item.state = 'pending'
+      queue.push(item)
+    } else {
+      item.state = 'skipped'
+      item.message = '不是视频，无法换音轨'
+    }
+  }
+
+  // 固定 2 个 worker 从同一条队列里取活：取一条 → 提交 → **等它真的合成完** → 再取下一条。
+  // "等它合成完"这一步不能省：只给提交限流的话，20 条素材的 ffmpeg 还是会在后端一起开起来。
+  const cursor = { next: 0 }
+  const workers = []
+  for (let i = 0; i < Math.min(BATCH_COMPOSE_CONCURRENCY, queue.length); i += 1) {
+    workers.push(runBatchBgmWorker(queue, cursor, musicId))
+  }
+  await Promise.all(workers)
+
+  // 中断/离开页面后没轮到的，标成跳过，别在弹窗里一直挂着"等待中"
+  for (const item of queue) {
+    if (item.state === 'pending') {
+      item.state = 'skipped'
+      item.message = batchBgmCancelRequested.value ? '已中断，未执行' : '页面已离开，未执行'
+    }
+  }
+
+  batchBgmRunning.value = false
+  batchBgmFinished.value = true
+  // 页面已经走了就不用再收尾（后端那几条合成照旧在跑，下次进列表从状态列看结果）
+  if (batchPageDisposed) return
+  await fetchMaterials(true)
+
+  const okCount = batchBgmItems.value.filter((item) => item.state === 'done').length
+  const failCount = batchBgmItems.value.filter((item) => item.state === 'failed').length
+  summarizeBatch('批量合成背景音乐', batchBgmItems.value, okCount, failCount)
+}
+
+async function runBatchBgmWorker(queue, cursor, musicId) {
+  while (true) {
+    if (batchBgmCancelRequested.value || batchPageDisposed) return
+    const index = cursor.next
+    cursor.next += 1
+    if (index >= queue.length) return
+
+    const item = queue[index]
+    item.state = 'running'
+    item.progress = 0
+    item.message = '正在提交合成任务…'
+
+    let taskId = ''
+    try {
+      const res = await musicApi.compose(item.disk, musicId, { silent: true })
+      taskId = res.data?.task_id
+      if (!taskId) throw new Error('后端没有返回任务号')
+      applyBgmToRow(item.disk, { status: 'running', text: '合成中', progress: 0, message: '' })
+    } catch (error) {
+      // 具体原因（素材不存在、正在合成中、没有视频轨…）留在这一行上
+      item.state = 'failed'
+      item.message = error?.message || '提交失败'
+      continue
+    }
+
+    await waitBatchBgmTask(item, taskId)
+  }
+}
+
+/** 盯住一个合成任务直到它有结果。终态和单个合成那套一致：done / cancelled / failed。 */
+async function waitBatchBgmTask(item, taskId) {
+  const deadline = Date.now() + BATCH_COMPOSE_TIMEOUT_MS
+  while (true) {
+    if (batchBgmCancelRequested.value) {
+      // 真去掐后端的 ffmpeg：只停前端循环的话，那个进程会继续写文件
+      try {
+        await musicApi.cancelTask(taskId)
+      } catch (error) {
+        /* 任务已经结束了，不用额外处理 */
+      }
+      item.state = 'skipped'
+      item.message = '已中断'
+      return
+    }
+    if (batchPageDisposed) {
+      // 离开页面：不再轮询，但也不中断——后端那条合成会照常跑完
+      item.state = 'skipped'
+      item.message = '页面已离开，合成仍在后台继续'
+      return
+    }
+
+    await sleep(BATCH_POLL_MS)
+
+    let task = null
+    try {
+      const res = await musicApi.getTask(taskId)
+      task = res.data || {}
+    } catch (error) {
+      item.state = 'failed'
+      item.message = '查不到合成进度（后端可能重启过），请刷新列表确认结果'
+      return
+    }
+
+    item.progress = Number(task.progress) || 0
+    if (task.message) item.message = task.message
+
+    if (task.state === 'queued' || task.state === 'running') {
+      applyBgmToRow(item.disk, {
+        status: 'running',
+        text: '合成中',
+        progress: task.progress,
+        message: ''
+      })
+      if (Date.now() > deadline) {
+        item.state = 'failed'
+        item.message = '等太久没有结果（超过 30 分钟），请刷新列表确认'
+        return
+      }
+      continue
+    }
+
+    if (task.state === 'done') {
+      item.state = 'done'
+      item.progress = 100
+      item.message = task.output ? `→ ${task.output}` : ''
+      // 成品换了名字：把这一条跟过去，之后的状态刷新/重新合成才不会指着旧文件
+      if (task.output) {
+        item.disk = task.output
+        item.name = task.output
+      }
+      return
+    }
+
+    if (task.state === 'cancelled') {
+      item.state = 'skipped'
+      item.message = '已中断'
+      return
+    }
+
+    item.state = 'failed'
+    item.message = task.message || '合成失败'
+  }
+}
+
+const cancelBatchBgm = () => {
+  if (!batchBgmRunning.value) return
+  batchBgmCancelRequested.value = true
+  ElMessage.info('正在中断：已提交的合成会让后端掐掉')
 }
 
 // 上传素材
@@ -957,6 +1642,10 @@ const handlePreview = (material) => {
   // 等对话框真正挂载后再塞数据，否则 <video> 首次渲染时拿不到 src
   nextTick(() => {
     currentMaterial.value = material
+    // 素材既不是视频也不是图片时，弹窗里显示的是"文件信息 + 下载按钮"那一支，
+    // 根本没有 media 元素可以等 loadeddata/load——转圈得当场收掉，
+    // 否则它会一直盖在文件信息上，看起来又是个"预览出不来"。
+    if (!isVideoFile(material) && !isImageFile(material)) previewLoading.value = false
   })
 }
 
@@ -1044,6 +1733,9 @@ onBeforeUnmount(() => {
     statusTimer = null
   }
   stopMusicPreview()
+  // 两个批量循环也收尾退出。注意这只是停前端的轮询，**不会**去中断后端已经提交的
+  // 合成任务——离开页面不等于不要那几条结果（见 waitBatchBgmTask 里的判断）。
+  batchPageDisposed = true
 })
 </script>
 
@@ -1068,11 +1760,25 @@ onBeforeUnmount(() => {
     border-radius: 4px;
     box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.1);
     padding: 20px;
+
+    /* 整行可点（点一下 = 勾选这条素材），所以行要给"能点"的样子 */
+    .material-select-table {
+      :deep(.el-table__row) {
+        cursor: pointer;
+      }
+
+      /* 勾选框那一格点上去就是翻勾选，指针别跟着变成"点击整行"的样子 */
+      :deep(.el-table__row .el-table-column--selection) {
+        cursor: default;
+      }
+    }
     
     .material-search {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
       margin-bottom: 20px;
       
       .el-input {
@@ -1081,16 +1787,47 @@ onBeforeUnmount(() => {
       
       .action-buttons {
         display: flex;
+        align-items: center;
         gap: 10px;
+
+        /* Element Plus 会给相邻的两个 el-button 加 12px 的 margin-left，
+           和这里的 gap 叠在一起间距会一大一小（中间还夹着"已选 N 项"那个 span，
+           相邻选择器只对直接挨着的那几对生效）。统一交给 gap。 */
+        :deep(.el-button + .el-button) {
+          margin-left: 0;
+        }
+      }
+
+      /* 已选数量：批量按钮的启用条件，所以一直显示（0 项时它就在解释按钮为什么是灰的） */
+      .selected-hint {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 13px;
+        color: $text-regular;
+        white-space: nowrap;
+
+        &.is-empty {
+          color: $text-placeholder;
+        }
+
+        .selected-hint-icon {
+          color: $text-secondary;
+          cursor: help;
+        }
+      }
+
+      .batch-btn-tip {
+        display: inline-flex;
       }
     }
     
     .material-list {
       margin-top: 20px;
     }
-
-    .material-pagination {
-      margin-top: 16px;
+    /* 分页和「发布记录」同一套样式：右对齐、统一上边距 */
+    .pager {
+      margin-top: 14px;
       display: flex;
       justify-content: flex-end;
     }
@@ -1326,5 +2063,28 @@ onBeforeUnmount(() => {
 
 .mt12 {
   margin-top: 12px;
+}
+
+/* 两个批量弹窗共用的外壳（逐条清单在 components/BatchTaskList.vue 里） */
+.batch-run {
+  padding: 0 4px;
+
+  .batch-opts {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 14px 0 10px;
+  }
+
+  .batch-opts-hint {
+    font-size: 12px;
+    color: #909399;
+  }
+
+  /* 批次总进度：和逐条进度条拉开距离，别让人以为是一回事 */
+  .batch-bar {
+    margin-bottom: 14px;
+  }
 }
 </style>

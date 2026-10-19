@@ -9,6 +9,21 @@
 - 只发 2 张图，token 成本极低、响应快，且对绝大多数笔记已经够用；
 - 需要更细的理解时再扩展成多帧采样，接口不用变。
 
+为什么把**素材文件名**也发过去
+------------------------------
+两帧画面能看出"画面里有什么"，但看不出"这条视频按什么口径在讲"：同一条海景视频，
+素材叫「2026-10-09 青岛日落」和叫「随手拍的」写出来的文案天差地别——用户起文件名时
+往往已经把主题/时间/地点/品类写进去了，这是零成本的补充信息，浪费掉很可惜
+（用户诉求："素材生成文案时要把素材的文件名称考虑进去"）。
+
+它是**弱线索**：画面优先，名字和画面对不上就不采纳（系统提示词里写明了），
+免得为了迁就一个过期的文件名去编造。文件名经 `material_name_of` 清洗后再发
+（去扩展名、去 uuid 前缀、去换行/控制字符、限长），不会把路径或脏字符带进提示词。
+
+例外：**上一版 AI 标题改出来的文件名不当线索**。生成文案后素材会被改名成标题，
+再喂回去等于拿上一版答案当提示——用户点「重新生成」只会得到同一份文案。
+判断在调用方（`sau_backend_xhs._material_hint_name`），这里只管"给不给"。
+
 只用标准 `requests` 调 `/chat/completions`，不引入任何厂商 SDK——
 这样任何"OpenAI 格式"的服务（官方、中转、vLLM、Ollama 的兼容层…）都能直接填 URL/Key/模型名用。
 """
@@ -33,6 +48,44 @@ FRAME_MAX_WIDTH = 720
 # 正文默认字数上限。做成设置项了，可以在「模型设置」页调，不用改代码。
 DEFAULT_DESC_MAX_CHARS = 100
 
+#: 喂给模型的素材文件名长度上限。
+#:
+#: 文件名只是线索：相机/手机导出的一长串编号（`VID_20261009_183012_1_1_1`）没什么信息量，
+#: 却会实打实占 token。截断到 60 字足够装下"日期 + 主题"这种真有用的名字。
+MATERIAL_NAME_MAX_CHARS = 60
+
+#: 上传时拼在磁盘名前面的 uuid 前缀（`<uuid>_原名.mp4`，见 `sau_backend.py` 的 `/upload`）。
+#: 界面上的「文件名」列不带它，喂给模型时也不该带——一串十六进制对模型只有干扰。
+_UUID_PREFIX_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[_-]"
+)
+
+
+def material_name_of(video_path: str | Path, max_chars: int = MATERIAL_NAME_MAX_CHARS) -> str:
+    """素材文件（名/路径）→ 可以喂给模型的「参考名」。
+
+    只留下模型用得上的那部分：
+
+    * 取 basename——绝对路径对模型是噪音，也不该把用户的目录结构发出去；
+    * 去掉扩展名（`.mp4` 没有信息量）；
+    * 去掉上传时加的 uuid 前缀，还原成用户在「素材管理」里看到的名字；
+    * 换行/制表/控制字符换成空格再收敛——文件名是**外部输入**，一个带换行的名字
+      本身就能在提示词里"另起一行"，这类字符一律先清掉；
+    * 超长截断。
+
+    洗不出东西（空文件名、只剩一串分隔符之类）就返回空串，调用方据此不发这一段。
+    """
+    name = Path(str(video_path or "")).name
+    name = _UUID_PREFIX_RE.sub("", name)
+    # 只在最后一段"看起来像扩展名"时才切（`_safe_upload_name` 用的是同一个判据）。
+    # 用裸 `Path.stem` 会把 `v1.2 标题` 切成 `v1`——文件名叫这个完全合法，
+    # 而且改名后的素材名里允许出现 `.` 之外的任何字符，不该在这里丢信息。
+    suffix = Path(name).suffix
+    stem = name[: -len(suffix)] if re.fullmatch(r"\.[A-Za-z0-9]{1,6}", suffix or "") else name
+    stem = re.sub(r"[\x00-\x1f\x7f]", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return stem[:max_chars].strip()
+
 
 def build_system_prompt(max_chars: int = DEFAULT_DESC_MAX_CHARS) -> str:
     """按字数上限生成系统提示词——限制变了，措辞也跟着变，不用两处维护。"""
@@ -56,7 +109,11 @@ def build_system_prompt(max_chars: int = DEFAULT_DESC_MAX_CHARS) -> str:
 5. **正文里绝对不要出现任何暴露素材来源或创作过程的表达**，例如"第一帧""尾帧"
    "首帧""画面""图片""截图""这两张图""从画面可以看出""根据提供的图片"等。
    读者不应该感觉到任何"分析"痕迹；
-6. 只写你能确定的信息。看不清的（价格、地点、品牌、具体数字）一律不要编造。
+6. 只写你能确定的信息。看不清的（价格、地点、品牌、具体数字）一律不要编造；
+7. 如果消息里带了**素材文件名**（用户自己给这条素材起的名字），把它当作理解内容的线索：
+   它常常写着主题、时间、地点、品类，能对上画面就用上，让文案更贴题；
+   但**画面永远优先**——名字和画面对不上时以画面为准，也不要为了迁就名字去编造，
+   更不要把文件名原样照抄成标题。
 
 输出 JSON 结构（**字段顺序必须照抄：tags 写在 desc 前面**）：
 {{"title": "...", "tags": ["...", "...", "..."], "desc": "..."}}"""
@@ -117,6 +174,12 @@ def extract_key_frames(video_path: str | Path, out_dir: str | Path | None = None
 
     first = work / "first.jpg"
     ok, err = _run_ffmpeg(ffmpeg, ["-y", "-ss", "0", "-i", str(video), "-frames:v", "1", "-vf", scale, "-q:v", "3", str(first)])
+    if not (ok and first.is_file() and first.stat().st_size > 0):
+        # 静态图（素材库里的 jpg/png）必然走到这里：`-ss 0` 在 `-i` **之前**时 ffmpeg 会先
+        # 定位再解码，而图片只有一帧，定位完就没帧可编了（报 "Output file is empty"）。
+        # 去掉 `-ss` 再试一次——图片无所谓定位，顺带也兜住时长极短的视频。
+        # 只在**第一次已经失败**时才重试，所以对原来能跑的视频没有任何行为变化。
+        ok, err = _run_ffmpeg(ffmpeg, ["-y", "-i", str(video), "-frames:v", "1", "-vf", scale, "-q:v", "3", str(first)])
     if ok and first.is_file() and first.stat().st_size > 0:
         result["first"] = str(first)
     else:
@@ -285,8 +348,22 @@ def _clamp_desc(desc: str, max_chars: int) -> str:
     return head.rstrip() + "…"
 
 
-def generate_note_copy(video_path: str | Path, hints: str = "", desc_max_chars: int | None = None) -> dict:
+def generate_note_copy(
+    video_path: str | Path,
+    hints: str = "",
+    desc_max_chars: int | None = None,
+    material_name: str | None = None,
+) -> dict:
     """抽首尾帧 → 让多模态模型产出 {title, desc, tags}。
+
+    Args:
+        video_path: 素材文件（也是文件名线索的默认来源）。
+        hints: 用户在界面上填的补充信息。
+        desc_max_chars: 正文上限，默认读设置。
+        material_name: 发给模型的**素材文件名线索**。
+            `None`（默认）= 从 `video_path` 的文件名推（见 `material_name_of`），
+            这也是"生成文案要把文件名考虑进去"的落点；
+            传空串 = 明确不带（例如文件名就是上一版 AI 标题，见模块说明）。
 
     Returns:
         dict: {"ok": bool, "title", "desc", "tags", "frames", "model", "raw", "error"}
@@ -294,6 +371,9 @@ def generate_note_copy(video_path: str | Path, hints: str = "", desc_max_chars: 
     cfg = get_vision_config()
     if desc_max_chars is None:
         desc_max_chars = int(cfg.get("desc_max_chars") or DEFAULT_DESC_MAX_CHARS)
+    if material_name is None:
+        material_name = material_name_of(video_path)
+    material_name = (material_name or "").strip()
     out: dict = {
         "ok": False,
         "title": "",
@@ -303,6 +383,7 @@ def generate_note_copy(video_path: str | Path, hints: str = "", desc_max_chars: 
         "model": cfg.get("model"),
         "raw": "",
         "desc_max_chars": desc_max_chars,
+        "material_name": material_name,
     }
 
     frames = extract_key_frames(video_path)
@@ -321,6 +402,12 @@ def generate_note_copy(video_path: str | Path, hints: str = "", desc_max_chars: 
     content.append({"type": "image_url", "image_url": {"url": _to_data_url(frames["first"])}})
     if frames.get("last"):
         content.append({"type": "image_url", "image_url": {"url": _to_data_url(frames["last"])}})
+    if material_name:
+        # 放在图后面：先看画面，再拿到"用户是怎么称呼这条素材的"这条线索，
+        # 模型不至于被一个过期的名字先入为主。
+        content.append(
+            {"type": "text", "text": f"素材文件名：{material_name}（用户自己起的，仅作线索）"}
+        )
     extra = (cfg.get("extra_prompt") or "").strip()
     if extra:
         content.append({"type": "text", "text": f"额外要求：{extra}"})

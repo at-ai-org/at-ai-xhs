@@ -22,9 +22,12 @@ export const musicApi = {
     return http.post(`/music/${id}/delete`, {})
   },
 
-  /** 给一条素材合成背景音乐 → { task_id } */
-  compose(material, musicId) {
-    return http.post('/music/compose', { material, music_id: musicId })
+  /**
+   * 给一条素材合成背景音乐 → { task_id }
+   * config 透传给 axios（批量合成时用 { silent: true } 自己收集错误）。
+   */
+  compose(material, musicId, config = {}) {
+    return http.post('/music/compose', { material, music_id: musicId }, config)
   },
 
   /** 合成进度（前端进度条靠它） */

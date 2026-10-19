@@ -62,12 +62,19 @@ request.interceptors.response.use(
     if (data.code === 200 || data.success) {
       return data
     } else {
-      ElMessage.error(data.msg || data.message || '请求失败')
+      // silent：调用方自己展示错误（批量任务会把每条的原因收在弹窗里，
+      // 这里再弹一遍就是几十条 toast 一起糊在屏幕上）
+      if (!response.config?.silent) ElMessage.error(data.msg || data.message || '请求失败')
       return Promise.reject(new Error(data.msg || data.message || '请求失败'))
     }
   },
   (error) => {
     console.error('响应错误:', error)
+
+    // silent 只关掉"弹提示"这一件事：401 的重新登录、以及一定要 reject 的语义都不受影响。
+    const notify = (msg) => {
+      if (!error.config?.silent) ElMessage.error(msg)
+    }
     
     // 处理HTTP错误状态码
     if (error.response) {
@@ -88,30 +95,38 @@ request.interceptors.response.use(
       // 注意：Flask 自己产生的错误页（如 413 的 HTML）不是 JSON，取不到 msg，走下面的兜底。
       const serverMsg = data && typeof data === 'object' ? data.msg || data.message : ''
       if (serverMsg) {
-        ElMessage.error(serverMsg)
-        return Promise.reject(error)
+        notify(serverMsg)
+        // 用后端那句话 reject，而不是把 axios 的 error 原样抛出去：
+        // 调用方拿到的 `error.message` 才是「这条素材正在合成中，请等它结束」这种人话，
+        // 而不是 "Request failed with status code 409"——批量任务要把原因写到每一条上，
+        // 而它带的是 silent（不弹 toast），拿不到这句话就等于没有原因。
+        // 原始 error 挂在 cause/response 上，要查 status、config 的还能查到。
+        const wrapped = new Error(serverMsg)
+        wrapped.cause = error
+        wrapped.response = error.response
+        return Promise.reject(wrapped)
       }
       switch (status) {
         case 401:
-          ElMessage.error('未授权，请重新登录')
+          notify('未授权，请重新登录')
           break
         case 403:
-          ElMessage.error('拒绝访问')
+          notify('拒绝访问')
           break
         case 404:
-          ElMessage.error('请求地址不存在')
+          notify('请求地址不存在')
           break
         case 429:
-          ElMessage.error('操作太频繁，请稍后再试')
+          notify('操作太频繁，请稍后再试')
           break
         case 500:
-          ElMessage.error('服务器内部错误')
+          notify('服务器内部错误')
           break
         default:
-          ElMessage.error('网络错误')
+          notify('网络错误')
       }
     } else {
-      ElMessage.error('网络连接失败')
+      notify('网络连接失败')
     }
     
     return Promise.reject(error)

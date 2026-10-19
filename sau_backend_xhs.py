@@ -3,12 +3,12 @@
 
 把原本只在命令行上的页面操作能力搬到网页上，全部通过浏览器操作完成：
 
-- `GET  /xhs/accounts`          列出账号（cookie 文件），可选校验有效性
-- `GET  /xhs/login/stream`      扫码登录：二维码经 SSE 推到网页，扫码完成即推送结果
-- `POST /xhs/selftest`          页面契约自检（不提交任何内容）
-- `POST /xhs/collections`       只读列出账号可选合集
-- `POST /xhs/publish`           发布视频（支持合集 / 定时 / 可见范围 / 原创 / dry-run）
+- `POST /xhs/publish`           发布视频（支持合集 / 定时 / 可见范围 / 原创）
 - `GET  /xhs/task/<task_id>`    发布任务进度（含每一步的状态）
+
+账号统一来自「账号管理」（`user_info`，type=1）：请求体传 `account_id`，
+后端解析出 `cookiesFile/` 下的 cookie 文件。工作台不再单独扫码登录，
+`/xhs/login/stream` 等旧接口仅作兼容保留。
 
 设计约束
 --------
@@ -43,14 +43,17 @@ from myUtils.app_settings import (
     public_settings,
     save_settings,
 )
-from uploader.xiaohongshu_uploader.ai_copywriter import chat_completion, generate_note_copy
+from uploader.xiaohongshu_uploader.ai_copywriter import (
+    chat_completion,
+    generate_note_copy,
+    material_name_of,
+)
 from uploader.xiaohongshu_uploader.main import (
     XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
     XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED,
     XiaoHongShuVideo,
     cookie_auth as xhs_cookie_auth,
     xiaohongshu_list_collections,
-    xiaohongshu_selftest,
     xiaohongshu_setup,
 )
 
@@ -102,6 +105,32 @@ def account_file_for(account: str) -> Path:
     path = Path(BASE_DIR) / "cookies" / f"xiaohongshu_{safe}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _resolve_workbench_account(account_id) -> tuple[str, Path] | None:
+    """把「账号管理」里的小红书账号 id 解析成 (账号名, cookie 文件)。
+
+    工作台不再自己扫码登录：账号统一来自账号管理（`user_info`，type=1 是小红书），
+    cookie 落在 `cookiesFile/<filePath>`。查不到 / 不是小红书账号都返回 None，
+    调用方据此回 400/404。
+
+    返回的账号名用于合集缓存等按账号分家的路径，取 `userName`（账号管理里可改），
+    同名风险由 user_info 的「平台 + 用户名」唯一性兜底。
+    """
+    raw = str(account_id or "").strip()
+    if not raw or not raw.isdigit():
+        return None
+    with sqlite3.connect(Path(BASE_DIR) / "db" / "database.db") as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, type, filePath, userName FROM user_info WHERE id = ? AND type = 1",
+            (int(raw),),
+        ).fetchone()
+    if row is None or not (row["filePath"] or "").strip():
+        return None
+    cookie_file = Path(BASE_DIR) / "cookiesFile" / row["filePath"]
+    name = (row["userName"] or "").strip() or f"账号{row['id']}"
+    return name, cookie_file
 
 
 def resolve_video_path(raw: str) -> str:
@@ -346,46 +375,8 @@ def xhs_login_stream():
 
 
 # --------------------------------------------------------------------------- #
-# 只读操作：自检 / 合集列表
+# 只读操作：合集列表
 # --------------------------------------------------------------------------- #
-
-
-@xhs_bp.post("/selftest")
-def xhs_selftest_api():
-    """页面契约自检。
-
-    传 `video` 则做**深自检**：先把测试视频传上去（不会发布），
-    把编辑器撑出来后再探测——只有这样才能验证标题/正文/话题/定时/**合集**/发布按钮。
-    不传 `video` 则是浅自检，只验证上传区，其余契约必然报缺失（页面本来就没渲染）。
-    """
-    body = request.get_json(silent=True) or {}
-    account = body.get("account")
-    if not account:
-        return _err("缺少 account", 400)
-    af = account_file_for(account)
-    if not af.exists():
-        return _err("该账号还没有 cookie，请先扫码登录", 400)
-
-    probe_video = None
-    if body.get("video"):
-        candidate = resolve_video_path(body["video"])
-        if not Path(candidate).is_file():
-            return _err(f"测试视频不存在: {candidate}", 400)
-        probe_video = candidate
-    try:
-        with browser_session(af):
-            report = _run_async(
-                lambda: xiaohongshu_selftest(
-                    str(af),
-                    headless=bool(body.get("headless", True)),
-                    pages=tuple(body.get("pages") or ("login", "publish")),
-                    probe_video=probe_video,
-                ),
-                timeout=600,
-            )
-        return _ok(report.to_dict())
-    except Exception as exc:
-        return _err(f"自检失败: {exc}")
 
 
 @xhs_bp.post("/collections")
@@ -399,14 +390,24 @@ def xhs_collections_api():
     因此策略是：
     - 传 `video` → 真实读取（上传测试视频，**不会发布**），成功后写入缓存；
     - 不传 `video` → 直接返回缓存，秒回。
+
+    账号来自「账号管理」：请求体传 `account_id`（user_info 里 type=1 的那行）。
+    兼容旧的 `account`（cookie 文件名）用法，脚本/历史调用不至于断。
     """
     body = request.get_json(silent=True) or {}
-    account = body.get("account")
-    if not account:
-        return _err("缺少 account", 400)
-    af = account_file_for(account)
+
+    resolved = None
+    if body.get("account_id"):
+        resolved = _resolve_workbench_account(body["account_id"])
+        if resolved is None:
+            return _err("账号不存在或不是小红书平台的账号，请到「账号管理」核对", 400)
+    elif body.get("account"):
+        resolved = (str(body["account"]), account_file_for(str(body["account"])))
+    if resolved is None:
+        return _err("缺少 account_id", 400)
+    account, af = resolved[0], resolved[1]
     if not af.exists():
-        return _err("该账号还没有 cookie，请先扫码登录", 400)
+        return _err("该账号的 cookie 文件不存在，请到「账号管理」重新扫码授权", 400)
 
     # 不传视频 → 走缓存
     if not body.get("video"):
@@ -466,22 +467,30 @@ def xhs_publish_api():
     这样"点提交"和"真发出去"之间有一道人工闸门：AI 写得不对也不会直接发出去。
     """
     body = request.get_json(silent=True) or {}
-    account = body.get("account")
     video = body.get("video")
     title = (body.get("title") or "").strip()
     ai_generate = bool(body.get("ai_generate", True))
 
-    if not account:
-        return _err("缺少 account", 400)
+    # 账号来自「账号管理」（account_id）；兼容旧的 account（cookie 文件名）用法
+    resolved = None
+    if body.get("account_id"):
+        resolved = _resolve_workbench_account(body["account_id"])
+        if resolved is None:
+            return _err("账号不存在或不是小红书平台的账号，请到「账号管理」核对", 400)
+    elif body.get("account"):
+        resolved = (str(body["account"]), account_file_for(str(body["account"])))
+    if resolved is None:
+        return _err("缺少 account_id", 400)
+    account, af = resolved[0], resolved[1]
+
     if not video:
         return _err("缺少 video（素材文件名或绝对路径）", 400)
     # 交给 AI 生成时，标题可以先留空，等生成完再确认
     if not title and not ai_generate:
         return _err("未开启 AI 生成时标题必填（不超过 20 字）", 400)
 
-    af = account_file_for(account)
     if not af.exists():
-        return _err("该账号还没有 cookie，请先扫码登录", 400)
+        return _err("该账号的 cookie 文件不存在，请到「账号管理」重新扫码授权", 400)
 
     video_path = resolve_video_path(video)
     if not Path(video_path).is_file():
@@ -502,6 +511,8 @@ def xhs_publish_api():
             "stage": "generate" if ai_generate else "confirm",
             "message": "AI 正在生成文案…" if ai_generate else "等待人工确认后发布",
             "account": account,
+            # 账号管理里的账号 id：发布记录用它关联账号（工作台旧账号名则留空）
+            "account_id": int(body["account_id"]) if str(body.get("account_id") or "").strip().isdigit() else None,
             "account_file": str(af),
             "video": video_path,
             "video_name": Path(video_path).name,
@@ -515,7 +526,6 @@ def xhs_publish_api():
             "original": bool(body.get("original")),
             "schedule": schedule_raw or None,
             "thumbnail": body.get("thumbnail") or None,
-            "dry_run": bool(body.get("dry_run")),
             "scheduled": bool(schedule_raw),
             "debug": bool(body.get("debug", False)),
             # 提交阶段就把模式钉死成有头：发布不允许无头（见确认发布处的说明）。
@@ -771,6 +781,46 @@ def _delete_bgm_status(disk_name: str) -> None:
         print(f"⚠️ 清理背景音乐状态失败（不影响改名）: {exc}")
 
 
+# --------------------------------------------------------------------------- #
+# 生成文案用的「素材文件名」线索
+# --------------------------------------------------------------------------- #
+
+
+def _name_is_ai_title(stem: str, disk_name: str) -> bool:
+    """`stem` 是不是**上一次 AI 生成标题**改出来的文件名。
+
+    生成文案后素材会被改名成标题（见 `_rename_material_to_title`），文案同时存在
+    `material_copy` 里、以新文件名为 key。所以"文件名 == 上一次存下来的标题"就说明
+    这个名字不是用户起的，而是上一版 AI 的产出——再喂回模型等于给答案，
+    用户点「重新生成」只会拿到几乎一样的一份文案。
+
+    改名时可能补了重号（`标题2.mp4`）、可能带着背景音乐的 `-音乐名` 后缀
+    （`标题-轻音乐.mp4`），这两种都算 AI 标题。
+    """
+    title = _safe_title_for_filename((load_material_copy(disk_name) or {}).get("title") or "")
+    if not title or not stem.startswith(title):
+        return False
+    return re.fullmatch(r"\d*(?:-.*)?", stem[len(title) :]) is not None
+
+
+def _material_hint_name(disk_name: str) -> str:
+    """生成文案时发给模型的「素材文件名」线索（空串 = 不发）。
+
+    用户起名时往往已经把主题/时间/地点/品类写进去了，这是零成本的补充信息
+    （见 `ai_copywriter` 的模块说明）。两种情况下**不给**：
+
+    * 这个名字是上一版 AI 标题改出来的（`_name_is_ai_title`）——给答案不算线索；
+    * 洗完什么都不剩（空名字、只剩 uuid 前缀之类）。
+
+    这里只判断**给不给**；清洗（去扩展名 / uuid 前缀 / 控制字符 / 限长）统一在
+    `material_name_of` 里做，免得两边口径不一致。
+    """
+    stem = material_name_of(disk_name)
+    if not stem or _name_is_ai_title(stem, disk_name):
+        return ""
+    return stem
+
+
 def _generate_worker(task_id: str) -> None:
     """阶段一：AI 生成文案。完成后进入 `pending_confirm`，等人确认。"""
     snapshot = _task_snapshot(task_id)
@@ -782,7 +832,12 @@ def _generate_worker(task_id: str) -> None:
         return
 
     try:
-        res = generate_note_copy(snapshot["video"], snapshot.get("hints") or "")
+        # 素材文件名一并交给模型当线索（用户起名时写的主题/时间/地点就靠它带过去）
+        res = generate_note_copy(
+            snapshot["video"],
+            snapshot.get("hints") or "",
+            material_name=_material_hint_name(Path(snapshot["video"]).name),
+        )
     except Exception as exc:
         _task_update(
             task_id,
@@ -882,8 +937,6 @@ def xhs_task_confirm(task_id: str):
             patch[key] = (body.get(key) or "").strip() or None
     if "original" in body:
         patch["original"] = bool(body.get("original"))
-    if "dry_run" in body:
-        patch["dry_run"] = bool(body.get("dry_run"))
 
     # 用确认后的最终值做校验（而不是提交时的旧值）
     final_title = (patch.get("title", snapshot.get("title") or "") or "").strip()
@@ -936,8 +989,8 @@ def _open_publish_record(snapshot: dict, patch: dict, mode_text: str = "无头�
                 source=records.SOURCE_XHS_WORKBENCH,
                 platform=1,
                 platform_name="小红书",
-                # 工作台的账号是 cookies/ 下的 cookie 名（自己扫码登录出来的），
-                # 和发布中心 user_info 里的账号不是一套，所以 account_id 留空。
+                # 账号来自「账号管理」时能对上 id；走兼容路径（旧账号名）则留空
+                account_id=snapshot.get("account_id"),
                 account_name=snapshot.get("account") or "",
                 account_file=account_file.name,
                 material=video_path.name,
@@ -1080,7 +1133,6 @@ def _publish_worker(task_id: str) -> None:
             collection_name=snapshot.get("collection") or None,
             visibility=snapshot.get("visibility") or None,
             is_original=bool(snapshot.get("original")),
-            dry_run=bool(snapshot.get("dry_run")),
         )
         with _tasks_lock:
             _tasks[task_id]["_app"] = app
@@ -1166,9 +1218,6 @@ def _finish_record(
         verified = any(s.get("step") == "verify_published" and s.get("status") == "ok" for s in steps)
         if failed:
             status = records.STATUS_FAILED
-        elif snapshot.get("dry_run"):
-            status = records.STATUS_SUCCESS
-            message = "演练完成（dry-run，未真正发布）"
         elif snapshot.get("scheduled"):
             status = records.STATUS_SUCCESS
             message = f"已定时提交（{snapshot.get('schedule')}）"
@@ -1317,6 +1366,10 @@ def xhs_analyze():
 
     只读视频文件，不碰小红书账号，所以不需要 cookie、也不占用浏览器锁。
 
+    生成时会把**素材文件名**（用户自己起的名字，见 `_material_hint_name`）一并交给
+    模型当线索——用户起名时写的主题/时间/地点能直接反映到文案里；文件名若是上一版
+    AI 标题改出来的则不发，免得「重新生成」只是把上一版原样端回来。
+
     `save=true` 时还会把结果**落到素材上**：写 material_copy，并把素材文件改名成标题
     （文件名只保留中文和数字，见 `_safe_title_for_filename`）——
     和发布流程里 AI 生成文案后的行为保持一致。改完的新文件名会随响应返回，
@@ -1332,7 +1385,12 @@ def xhs_analyze():
         return _err(f"视频文件不存在: {video_path}", 400)
 
     try:
-        result = generate_note_copy(video_path, hints=(body.get("hints") or "").strip())
+        # 素材文件名一并交给模型当线索（用户起名时写的主题/时间/地点就靠它带过去）
+        result = generate_note_copy(
+            video_path,
+            hints=(body.get("hints") or "").strip(),
+            material_name=_material_hint_name(Path(video_path).name),
+        )
     except Exception as exc:
         return _err(f"生成失败: {exc}")
 
