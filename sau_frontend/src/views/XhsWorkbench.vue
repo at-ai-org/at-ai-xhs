@@ -1,130 +1,69 @@
 <template>
   <div class="xhs-workbench">
-    <!-- 账号 -->
+    <!-- 账号：从账号管理里选小红书平台的账号，不再单独扫码登录 -->
     <el-card shadow="never" class="mb16">
-      <template #header>
-        <div class="card-header">
-          <span>① 账号与登录</span>
-          <el-button link type="primary" @click="loadAccounts">刷新</el-button>
-        </div>
-      </template>
+      <template #header><span>① 账号</span></template>
       <el-form :inline="true">
-        <el-form-item label="账号标识">
-          <el-input v-model="account" placeholder="例如 me" style="width: 180px" />
-        </el-form-item>
-        <el-form-item>
-          <el-button type="primary" :loading="loggingIn" @click="startLogin">扫码登录</el-button>
-          <el-button :disabled="!account" @click="checkAccount">校验登录态</el-button>
+        <el-form-item label="小红书账号">
+          <el-select
+            v-model="selectedAccountId"
+            placeholder="选择账号管理里的小红书账号"
+            style="width: 320px"
+            :loading="accountsLoading"
+          >
+            <el-option
+              v-for="a in xhsAccounts"
+              :key="a.id"
+              :label="`${a.name}${a.status === '正常' ? '' : '（' + a.status + '）'}`"
+              :value="a.id"
+            />
+          </el-select>
+          <!-- 刷新紧跟在下拉框旁边，不用跑去卡片右上角 -->
+          <el-button
+            class="ml8"
+            :icon="Refresh"
+            :loading="accountsLoading"
+            @click="refreshXhsAccounts"
+          >
+            刷新
+          </el-button>
         </el-form-item>
       </el-form>
-
       <el-alert
+        v-if="!xhsAccounts.length && !accountsLoading"
         type="warning"
         :closable="false"
         show-icon
-        title="同一个小红书账号只允许一个网页端会话"
-        description="工具登录后请不要再在别的浏览器登录小红书网页版，否则会把工具踢下线（手机 App 不受影响）。"
+        title="账号管理里还没有小红书平台的账号"
+        description="先到「账号管理」添加小红书账号并扫码授权，这里就能直接选用；同一个账号只允许一个网页端会话，登录后请不要再在别的浏览器登录小红书网页版。"
       />
-
-      <el-table v-if="accounts.length" :data="accounts" size="small" class="mt12">
-        <el-table-column prop="account" label="账号" width="140" />
-        <el-table-column label="状态" width="120">
-          <template #default="{ row }">
-            <el-tag v-if="row.valid === true" type="success" size="small">有效</el-tag>
-            <el-tag v-else-if="row.valid === false" type="danger" size="small">已失效</el-tag>
-            <el-tag v-else type="info" size="small">未校验</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="file" label="Cookie 文件" show-overflow-tooltip />
-      </el-table>
-    </el-card>
-
-    <!-- 扫码 -->
-    <el-card v-if="qrDataUrl || loginStatus" shadow="never" class="mb16">
-      <template #header><span>扫码登录</span></template>
-      <div class="qr-area">
-        <img v-if="qrDataUrl" :src="qrDataUrl" alt="小红书登录二维码" class="qr-img" />
-        <div class="qr-side">
-          <el-alert :type="loginStatusType" :closable="false" show-icon :title="loginStatus" />
-          <p class="hint">请用小红书 App 扫一扫。登录成功后本页会自动刷新账号状态。</p>
-          <el-button v-if="!loggingIn && qrDataUrl" @click="startLogin">重新获取二维码</el-button>
-        </div>
-      </div>
-    </el-card>
-
-    <!-- 自检 -->
-    <el-card shadow="never" class="mb16">
-      <template #header>
-        <div class="card-header">
-          <span>② 页面契约自检（不提交任何内容）</span>
-          <div>
-            <el-select v-model="selftestVideo" placeholder="选测试视频" clearable style="width: 220px; margin-right: 8px">
-              <el-option v-for="m in materials" :key="m.name" :label="m.name" :value="m.name" />
-            </el-select>
-            <el-button :loading="testing" @click="runSelftest(false)">浅自检</el-button>
-            <el-button type="primary" :loading="testing" :disabled="!selftestVideo" @click="runSelftest(true)">
-              深自检（先上传）
-            </el-button>
-          </div>
-        </div>
-      </template>
-      <p class="hint">
-        逐条检查发布页的控件是否还在。页面改版后跑一次就知道坏在哪条契约上，
-        改 <code>uploader/xiaohongshu_uploader/selectors.py</code> 里对应的 candidates 即可。
-      </p>
-      <el-alert
-        class="mb8"
-        type="info"
-        :closable="false"
-        show-icon
-        title="浅自检只能验证上传区：标题/正文/话题/定时/合集/发布按钮这些控件，要上传视频之后页面才会渲染出来"
-        description="想确认合集控件长什么样，请选一个测试视频做「深自检」——它会真的上传（但不会发布），把编辑器撑出来后再探测。"
-      />
-      <template v-if="selftest">
-        <el-alert
-          class="mb8"
-          :type="selftest.ok ? 'success' : 'error'"
-          :closable="false"
-          show-icon
-          :title="`命中 ${selftest.hit}/${selftest.total}${selftest.ok ? '，必填契约全部存在' : '，有必填契约缺失'}`"
-        />
-        <el-table :data="selftest.items" size="small" max-height="360">
-          <el-table-column prop="name" label="契约" width="200" />
-          <el-table-column prop="page" label="页面" width="90" />
-          <el-table-column label="必填" width="70">
-            <template #default="{ row }">{{ row.required ? '是' : '否' }}</template>
-          </el-table-column>
-          <el-table-column label="结果" width="100">
-            <template #default="{ row }">
-              <el-tag v-if="row.found" type="success" size="small">命中</el-tag>
-              <el-tag v-else-if="row.required" type="danger" size="small">缺失</el-tag>
-              <el-tag v-else type="info" size="small">无(可选)</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column prop="note" label="说明" show-overflow-tooltip />
-        </el-table>
-      </template>
     </el-card>
 
     <!-- 合集 -->
     <el-card shadow="never" class="mb16">
       <template #header>
         <div class="card-header">
-          <span>③ 合集</span>
-          <div>
-            <el-select v-model="collectionProbeVideo" placeholder="选测试视频以刷新" clearable style="width: 210px; margin-right: 8px">
-              <el-option v-for="m in materials" :key="m.name" :label="m.name" :value="m.name" />
-            </el-select>
-            <el-button :loading="loadingCollections" @click="loadCollections()">读缓存</el-button>
-            <el-button
-              type="primary"
-              :loading="loadingCollections"
-              :disabled="!collectionProbeVideo"
-              @click="loadCollections(collectionProbeVideo)"
-            >
-              刷新合集
-            </el-button>
-          </div>
+          <span>② 合集</span>
+          <!-- 操作紧跟标题、同一行左边，间距收紧 -->
+          <el-select
+            v-model="collectionProbeVideo"
+            placeholder="选测试视频以刷新"
+            clearable
+            size="small"
+            style="width: 200px"
+          >
+            <el-option v-for="m in materials" :key="m.name" :label="m.name" :value="m.name" />
+          </el-select>
+          <el-button size="small" :loading="loadingCollections" @click="loadCollections()">读缓存</el-button>
+          <el-button
+            size="small"
+            type="primary"
+            :loading="loadingCollections"
+            :disabled="!collectionProbeVideo"
+            @click="loadCollections(collectionProbeVideo)"
+          >
+            刷新合集
+          </el-button>
         </div>
       </template>
       <el-alert
@@ -142,7 +81,7 @@
 
     <!-- 发布 -->
     <el-card shadow="never">
-      <template #header><span>④ 发布视频笔记</span></template>
+      <template #header><span>③ 发布视频笔记</span></template>
       <el-form label-width="96px">
         <el-form-item label="视频素材">
           <el-upload
@@ -154,7 +93,14 @@
             <el-button :loading="uploading">上传本地视频</el-button>
             <span v-if="uploading && uploadPercent" class="hint ml8">上传中 {{ uploadPercent }}%</span>
           </el-upload>
-          <el-select v-model="form.video" placeholder="或从素材库选择" style="width: 320px; margin-left: 8px" clearable filterable>
+          <el-select
+            v-model="form.video"
+            placeholder="或从素材库选择"
+            style="width: 320px; margin-left: 8px"
+            clearable
+            filterable
+            @change="onVideoChange"
+          >
             <el-option
               v-for="m in materials"
               :key="m.name"
@@ -168,7 +114,7 @@
         <el-form-item label="AI 生成">
           <el-switch v-model="form.ai_generate" />
           <span class="hint ml8">
-            默认开启。提交后自动解析视频首尾画面生成标题与正文，生成完进入「待确认」
+            默认开启。关闭时若素材已带文案，会自动填充（选中素材或关掉开关时都会带出）
           </span>
         </el-form-item>
 
@@ -223,16 +169,9 @@
           <span class="hint ml8">仅在内容确实原创时才开启</span>
         </el-form-item>
 
-        <el-form-item label="演练模式">
-          <el-switch v-model="form.dry_run" />
-          <span class="hint ml8">
-            默认关闭（正常发布）。打开后只走完流程但不点提交按钮，用来验证页面操作是否正常。
-          </span>
-        </el-form-item>
-
         <el-form-item>
           <el-button type="primary" :loading="submitting" @click="doPublish">
-            {{ form.dry_run ? '提交演练任务' : '提交到队列' }}
+            提交到队列
           </el-button>
           <span class="hint ml8">
             提交后立即返回，在后台队列执行。AI 生成完文案会停在「待确认」，
@@ -246,8 +185,9 @@
     <el-card shadow="never" class="mb16">
       <template #header>
         <div class="card-header">
-          <span>⑤ 发布任务（后台队列，串行执行）</span>
-          <el-button link type="primary" @click="loadTasks">刷新</el-button>
+          <span>④ 发布任务（后台队列，串行执行）</span>
+          <!-- 这个刷新保持原来的位置：推到最右 -->
+          <el-button link type="primary" class="push-right" @click="loadTasks">刷新</el-button>
         </div>
       </template>
       <el-table :data="tasks" size="small" empty-text="还没有任务">
@@ -259,7 +199,7 @@
         </el-table-column>
         <el-table-column label="模式" width="80">
           <template #default="{ row }">
-            {{ row.dry_run ? '演练' : row.scheduled ? '定时' : '立即' }}
+            {{ row.scheduled ? '定时' : '立即' }}
           </template>
         </el-table-column>
         <el-table-column label="浏览器" width="90">
@@ -364,10 +304,6 @@
           <el-switch v-model="confirmForm.original" />
           <span class="hint ml8">仅在内容确实原创时开启</span>
         </el-form-item>
-        <el-form-item label="演练模式">
-          <el-switch v-model="confirmForm.dry_run" />
-          <span class="hint ml8">打开则只走流程、不点提交按钮</span>
-        </el-form-item>
       </el-form>
 
       <div class="mode-box">
@@ -396,22 +332,22 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Refresh } from '@element-plus/icons-vue'
 import { xhsApi } from '@/api/xhs'
+import { accountApi } from '@/api/account'
+import { useAccountStore } from '@/stores/account'
 
 const router = useRouter()
-const account = ref('default')
-const accounts = ref([])
-const loggingIn = ref(false)
-const loginStatus = ref('')
-const loginStatusType = ref('info')
-const qrDataUrl = ref('')
+const accountStore = useAccountStore()
 
-const testing = ref(false)
-const selftest = ref(null)
-const selftestVideo = ref('')
+// 账号：从「账号管理」里的小红书账号中选。不再单独扫码登录——账号管理那条路
+// 扫完码 cookie 就在 user_info 里，这里直接用。
+const xhsAccounts = computed(() => accountStore.accounts.filter((a) => a.platform === '小红书'))
+const selectedAccountId = ref(null)
+const accountsLoading = ref(false)
 
 const loadingCollections = ref(false)
 const collections = ref([])
@@ -440,8 +376,7 @@ const confirmForm = ref({
   collection: '',
   visibility: '公开可见',
   schedule: '',
-  original: false,
-  dry_run: false
+  original: false
 })
 
 const form = ref({
@@ -452,14 +387,11 @@ const form = ref({
   visibility: '公开可见',
   schedule: '',
   original: false,
-  // 默认关闭：默认就是正常发布，演练模式是手动打开的验证手段
-  dry_run: false,
   // 默认开启：提交后自动生成文案，生成完停在"待确认"由人把关
   ai_generate: true,
   hints: ''
 })
 
-let eventSource = null
 let pollTimer = null
 
 const STATE_LABELS = {
@@ -504,12 +436,21 @@ function browserModeLabel(row) {
   return '有头'
 }
 
-async function loadAccounts() {
+/** 拉一遍账号管理里的账号（小红书平台），默认选中第一个 */
+async function refreshXhsAccounts() {
+  accountsLoading.value = true
   try {
-    const res = await xhsApi.listAccounts(false)
-    if (res.code === 200) accounts.value = res.data || []
+    const res = await accountApi.getAccounts()
+    if (res.code === 200) {
+      accountStore.setAccounts(res.data)
+      if (!selectedAccountId.value && xhsAccounts.value.length) {
+        selectedAccountId.value = xhsAccounts.value[0].id
+      }
+    }
   } catch (e) {
     /* 拦截器已提示 */
+  } finally {
+    accountsLoading.value = false
   }
 }
 
@@ -524,114 +465,48 @@ async function loadMaterials() {
   }
 }
 
-function closeLoginStream() {
-  if (eventSource) {
-    eventSource.close()
-    eventSource = null
+/**
+ * 素材自带文案 → 自动填充标题/正文/话题。两个时机都会触发：
+ *   1. AI 生成关闭时选中素材（`@change`）；
+ *   2. **先选了素材、后关闭 AI 生成**（watch `ai_generate` 翻成 false）。
+ * AI 开着时不填（生成完会停在「待确认」再核对），免得两套文案打架。
+ * 已手填过内容时不覆盖，只补空缺。
+ */
+function fillCopyFromMaterial() {
+  if (form.value.ai_generate || !form.value.video) return
+  const m = materials.value.find((i) => i.name === form.value.video)
+  if (!m || !m.has_copy) return
+  const before = [form.value.title, form.value.desc, tagsText.value].join('|')
+  if (!form.value.title) form.value.title = m.title || ''
+  if (!form.value.desc) form.value.desc = m.desc || ''
+  if (!tagsText.value) tagsText.value = (m.tags || []).join(',')
+  const after = [form.value.title, form.value.desc, tagsText.value].join('|')
+  if (after !== before && (m.title || m.desc)) {
+    ElMessage.success('素材已带文案，已自动填充')
   }
 }
 
-function startLogin() {
-  if (!account.value) {
-    ElMessage.warning('请先填写账号标识')
-    return
-  }
-  closeLoginStream()
-  qrDataUrl.value = ''
-  loggingIn.value = true
-  loginStatus.value = '正在启动浏览器并获取二维码…'
-  loginStatusType.value = 'info'
-
-  eventSource = new EventSource(xhsApi.loginStreamUrl(account.value))
-  eventSource.onmessage = async (e) => {
-    let payload
-    try {
-      payload = JSON.parse(e.data)
-    } catch (err) {
-      return
-    }
-    if (payload.event === 'qrcode') {
-      qrDataUrl.value = payload.data?.image_data_url || ''
-      loginStatus.value = '二维码已就绪，请用小红书 App 扫码'
-      loginStatusType.value = 'info'
-    } else if (payload.event === 'done') {
-      const ok = !!payload.data?.success
-      loginStatus.value = ok ? '登录成功！' : `登录未完成：${payload.data?.message || '未知原因'}`
-      loginStatusType.value = ok ? 'success' : 'error'
-      loggingIn.value = false
-      closeLoginStream()
-      await loadAccounts()
-    } else if (payload.event === 'error') {
-      loginStatus.value = `登录出错：${payload.data}`
-      loginStatusType.value = 'error'
-      loggingIn.value = false
-      closeLoginStream()
-    } else if (payload.event === 'timeout') {
-      loginStatus.value = '等待超时，请重新获取二维码'
-      loginStatusType.value = 'warning'
-      loggingIn.value = false
-      closeLoginStream()
-    }
-  }
-  eventSource.onerror = () => {
-    // 连接结束时浏览器必然触发 onerror，这里只在还处于登录中时提示
-    if (loggingIn.value) {
-      loginStatus.value = '连接已断开，请重试'
-      loginStatusType.value = 'warning'
-      loggingIn.value = false
-    }
-    closeLoginStream()
-  }
+function onVideoChange() {
+  fillCopyFromMaterial()
 }
 
-async function checkAccount() {
-  try {
-    const res = await xhsApi.checkAccount(account.value)
-    if (res.code === 200) {
-      const ok = res.data?.valid
-      ElMessage[ok ? 'success' : 'warning'](res.data?.message || (ok ? 'cookie 有效' : 'cookie 失效'))
-      await loadAccounts()
-    }
-  } catch (e) {
-    /* 拦截器已提示 */
+// 先选素材、再关 AI 生成：关掉的那一刻同样把素材自带的文案带出来
+watch(
+  () => form.value.ai_generate,
+  (open) => {
+    if (!open) fillCopyFromMaterial()
   }
-}
+)
 
-async function runSelftest(deep = false) {
-  if (!account.value) {
-    ElMessage.warning('请先填写账号标识')
-    return
-  }
-  if (deep && !selftestVideo.value) {
-    ElMessage.warning('深自检需要先选一个测试视频')
-    return
-  }
-  testing.value = true
-  selftest.value = null
-  try {
-    const res = await xhsApi.selftest(account.value, deep ? selftestVideo.value : null)
-    if (res.code === 200) {
-      selftest.value = res.data
-      ElMessage[res.data.ok ? 'success' : 'warning'](
-        `${res.data.deep ? '深' : '浅'}自检完成，命中 ${res.data.hit}/${res.data.total}`
-      )
-    }
-  } catch (e) {
-    /* 拦截器已提示 */
-  } finally {
-    testing.value = false
-  }
-}
-
-async function loadCollections(video = null) {
-  if (!account.value) {
-    ElMessage.warning('请先填写账号标识')
+async function loadCollections() {
+  if (!selectedAccountId.value) {
+    ElMessage.warning('请先选择小红书账号')
     return
   }
   loadingCollections.value = true
   collectionMessage.value = ''
   try {
-    const res = await xhsApi.listCollections(account.value, video)
+    const res = await xhsApi.listCollections(selectedAccountId.value, collectionProbeVideo.value || null)
     if (res.code === 200) {
       const d = res.data || {}
       collections.value = d.detail?.collections || []
@@ -725,8 +600,7 @@ function openConfirm(row) {
     collection: row.collection || defaultCollection.value || '',
     visibility: row.visibility || '公开可见',
     schedule: row.schedule || '',
-    original: !!row.original,
-    dry_run: !!row.dry_run
+    original: !!row.original
   }
   confirmVisible.value = true
 }
@@ -754,7 +628,6 @@ async function doConfirm(mode = 'headed') {
       visibility: confirmForm.value.visibility,
       schedule: confirmForm.value.schedule || null,
       original: confirmForm.value.original,
-      dry_run: confirmForm.value.dry_run,
       // 固定有头；后端同样会强制覆盖成有头，两边一致
       headless: false
     })
@@ -819,11 +692,15 @@ async function loadDefaults() {
 
 /** 提交任务（不直接发布） */
 async function doPublish() {
+  if (!selectedAccountId.value) {
+    ElMessage.warning('请先选择小红书账号')
+    return
+  }
   if (!form.value.video) {
     ElMessage.warning('请先上传或选择视频素材')
     return
   }
-  // 交给 AI 生成时标题可以先留空
+  // 交给 AI 生成时标题可以先留空；关了 AI 就必须有标题（素材带的也算）
   if (!form.value.ai_generate && !form.value.title.trim()) {
     ElMessage.warning('未开启 AI 生成时，标题必填')
     return
@@ -836,7 +713,7 @@ async function doPublish() {
 
   try {
     const res = await xhsApi.publish({
-      account: account.value,
+      account_id: selectedAccountId.value,
       video: form.value.video,
       title: form.value.title,
       desc: form.value.desc,
@@ -846,8 +723,7 @@ async function doPublish() {
       collection: form.value.collection || null,
       visibility: form.value.visibility,
       schedule: form.value.schedule || null,
-      original: form.value.original,
-      dry_run: form.value.dry_run
+      original: form.value.original
     })
     if (res.code === 200) {
       const taskId = res.data?.task_id
@@ -875,16 +751,14 @@ async function doPublish() {
 }
 
 onMounted(() => {
-  loadAccounts()
+  refreshXhsAccounts()
   loadMaterials()
-  loadCollections() // 不传视频 → 走缓存，秒回
   loadDefaults() // 默认合集（风景）
   loadTasks()
   startPolling()
 })
 
 onBeforeUnmount(() => {
-  closeLoginStream()
   stopPolling()
 })
 </script>
@@ -899,31 +773,25 @@ onBeforeUnmount(() => {
 .mt8 { margin-top: 8px; }
 .mr8 { margin-right: 8px; }
 .ml8 { margin-left: 8px; }
+/* 卡片头：标题在左，跟在后面的操作控件紧挨着标题（不再分居两端） */
 .card-header {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 10px;
+
+  > span:first-child {
+    flex-shrink: 0;
+  }
+
+  /* 个别要留在右上角的按钮用这个推过去 */
+  .push-right {
+    margin-left: auto;
+  }
 }
 .hint {
   color: #909399;
   font-size: 12px;
   line-height: 1.6;
-}
-.qr-area {
-  display: flex;
-  gap: 24px;
-  align-items: flex-start;
-}
-.qr-img {
-  width: 220px;
-  height: 220px;
-  border: 1px solid #ebeef5;
-  border-radius: 4px;
-  object-fit: contain;
-  background: #fff;
-}
-.qr-side {
-  flex: 1;
 }
 
 .over-limit {

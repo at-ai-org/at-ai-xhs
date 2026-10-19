@@ -50,7 +50,9 @@ async def run(headless: bool, channel: str) -> int:
         context = await browser.new_context()
         try:
             page = await context.new_page()
-            ops = XhsPageOps(page, screenshot_dir="screenshots")
+            # 不传 screenshot_dir：默认落点就是 `screenshots/xiaohongshu/`，
+            # 和发布失败时的现场在同一个目录（这个脚本本来就是用来复现"哪一步坏"的）。
+            ops = XhsPageOps(page)
 
             r = await ops.goto(S.PUBLISH_ENTRY_PATH)
             print(f"  {r}")

@@ -1,36 +1,18 @@
 import { http } from '@/utils/request'
-import { withToken } from '@/utils/session'
 
 // 小红书 Web 操作相关 API（at-ai-xhs 改造新增）
 // 后端路由前缀 /xhs，见 sau_backend_xhs.py
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5409'
+//
+// 账号不再单独扫码登录：统一从「账号管理」选小红书平台的账号，
+// 请求体传 account_id（user_info 的 id），后端据此解析 cookiesFile/ 下的 cookie。
 
 export const xhsApi = {
-  /** 账号列表。check=true 会逐个校验 cookie（较慢） */
-  listAccounts(check = false) {
-    return http.get('/xhs/accounts', { params: { check: check ? 1 : 0 } })
-  },
-
-  /** 校验单个账号 cookie */
-  checkAccount(account) {
-    return http.get('/xhs/check', { params: { account } })
-  },
-
-  /**
-   * 页面契约自检（不提交任何内容）。
-   * 传 video 则做深自检：先上传测试视频把编辑器撑出来，才能验证合集等控件。
-   */
-  selftest(account, video = null) {
-    return http.post('/xhs/selftest', { account, video: video || null })
-  },
-
   /**
    * 读取账号合集。
    * 不传 video → 返回缓存（秒回）；传 video → 真实读取（会上传测试视频但不发布，分钟级）。
    */
-  listCollections(account, video = null) {
-    return http.post('/xhs/collections', { account, video: video || null })
+  listCollections(accountId, video = null) {
+    return http.post('/xhs/collections', { account_id: accountId, video: video || null })
   },
 
   /** 创建发布任务，返回 { task_id } */
@@ -88,9 +70,10 @@ export const xhsApi = {
   /**
    * AI 生成文案：抽首帧+尾帧交给视觉模型。
    * save=true 时顺便把结果存到素材上，之后发布中心选中素材即可自动带出。
+   * config 透传给 axios（批量生成时用 { silent: true } 自己收集错误）。
    */
-  analyze(video, hints = '', save = false) {
-    return http.post('/xhs/analyze', { video, hints, save })
+  analyze(video, hints = '', save = false, config = {}) {
+    return http.post('/xhs/analyze', { video, hints, save }, config)
   },
 
   /** 上传视频到素材库，返回素材文件名 */
@@ -101,17 +84,6 @@ export const xhsApi = {
   /** 素材列表（直接读 videoFile/ 目录） */
   listMaterials() {
     return http.get('/xhs/materials')
-  },
-
-  /**
-   * 扫码登录的 SSE 地址。
-   * 二维码与登录结果都由后端通过该连接推送（见 sau_backend_xhs.py 的 /xhs/login/stream）。
-   *
-   * `EventSource` 不能自定义请求头，所以登录态只能挂在查询串上（withToken）；
-   * 后端在 myUtils/web_auth.py 的 token_from() 里同时接受请求头和查询串。
-   */
-  loginStreamUrl(account) {
-    return withToken(`${API_BASE}/xhs/login/stream?account=${encodeURIComponent(account)}`)
   }
 }
 
