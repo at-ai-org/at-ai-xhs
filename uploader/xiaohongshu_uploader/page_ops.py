@@ -16,7 +16,8 @@
 ----
 - 所有操作返回 `OpResult`，**不抛异常**（除编程错误）。调用方决定是中断还是降级。
 - `dry_run=True` 时，`submit()` 只做预检不真点发布按钮。
-- 失败一律留全页截图，落在 `screenshots/`，排障时不用重新复现。
+- 失败一律留全页截图，落在 `screenshots/xiaohongshu/`（五个平台统一在
+  `screenshots/<平台>/` 下，见 `myUtils/publish_evidence.py`），排障时不用重新复现。
 - 平台硬约束（标题 20 字 / 正文 1000 字 / 话题 10 个）在输入前就截断，
   并且尽量读平台自带的计数提示做二次确认。
 """
@@ -34,6 +35,7 @@ from typing import Iterable, Sequence
 from patchright.async_api import Locator
 from patchright.async_api import Page
 
+import myUtils.publish_evidence as evidence
 from utils.humanize import human_type
 from utils.humanize import jitter_schedule
 from utils.log import xiaohongshu_logger
@@ -198,13 +200,17 @@ class XhsPageOps:
         *,
         debug: bool = False,
         dry_run: bool = False,
-        screenshot_dir: str | Path = "screenshots",
+        screenshot_dir: str | Path | None = None,
     ) -> None:
         self.page = page
         self.debug = debug
         self.dry_run = dry_run
-        self.screenshot_dir = Path(screenshot_dir)
-        self._screenshot_dir_ready = False
+        # 默认落点是 `screenshots/xiaohongshu/`（由 myUtils/publish_evidence 决定），
+        # 显式传 `screenshot_dir` 才另存——五个平台的失败现场都在
+        # `screenshots/<平台>/` 下，排障时不用挨个目录找。
+        self.screenshot_dir = (
+            Path(screenshot_dir) if screenshot_dir is not None else None
+        )
         # macOS 的"全选"是 Cmd+A，Windows/Linux 是 Ctrl+A。
         # 上游写死了 "Control+KeyA"，在 Mac 上无效——这里做成跨平台。
         self.modifier = "Meta" if sys.platform == "darwin" else "Control"
@@ -220,13 +226,19 @@ class XhsPageOps:
         xiaohongshu_logger.warning(f"{emoji} {text}")
 
     async def screenshot(self, tag: str) -> str:
-        """失败取证：留下全页截图。排障时不用重新复现。"""
-        if not self._screenshot_dir_ready:
-            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-            self._screenshot_dir_ready = True
-        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in tag)
-        path = self.screenshot_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{safe}.png"
+        """失败取证：留下全页截图。排障时不用重新复现。
+
+        走 `myUtils/publish_evidence`，所以它**绝不会把主流程搞失败**（自带 5 秒超时、
+        异常只记日志）——这条路的旧写法是没有 path、也没有自己超时的裸
+        `page.screenshot`，抖音/快手那边正是被它判死过一条本可以重试成功的发布。
+        """
+        if self.screenshot_dir is None:
+            return await evidence.capture(
+                self.page, "xiaohongshu", tag, logger=xiaohongshu_logger
+            )
+        path = self.screenshot_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{evidence.safe_tag(tag)}.png"
         try:
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
             await self.page.screenshot(path=str(path), full_page=True)
             self._warn("📸", f"已保存截图: {path}")
             return str(path)

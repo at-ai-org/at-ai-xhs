@@ -13,7 +13,7 @@
 1. 带着指定账号的 cookie 打开发布页，回答"登录态还有效吗"（跳到 /login 就是失效）；
 2. 把 `PDD_SELECTORS` 里每一组候选选择器逐个试一遍，报告**哪一条命中、命中的是哪个元素**；
 3. 把当时的完整 HTML、全页截图、以及所有 input / textarea / button 的清单一并落盘
-   （`pdd_debug/probe-<时间戳>/`），这样改选择器不用再让我猜页面长什么样。
+   （`screenshots/pdd/probe-<时间戳>/`），这样改选择器不用再让我猜页面长什么样。
 
 用法
 ----
@@ -42,10 +42,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from conf import BASE_DIR  # noqa: E402  # 导入它会把 PLAYWRIGHT_BROWSERS_PATH 指到项目内的 .browsers/
-from conf import PDD_DEBUG_DIR  # noqa: E402
 from conf import PDD_LOGIN_URL_MARKER  # noqa: E402
 from conf import PDD_PUBLISH_URL  # noqa: E402
 from conf import PDD_PUBLISH_URL_LEGACY  # noqa: E402
+import myUtils.publish_evidence as evidence  # noqa: E402
 from patchright.sync_api import sync_playwright  # noqa: E402
 from uploader.pdd_uploader.main import PDD_SELECTORS  # noqa: E402
 
@@ -182,7 +182,9 @@ def main() -> int:
 
     cookie_file = _resolve_cookie_file(args)
     url = PDD_PUBLISH_URL_LEGACY if args.legacy_url else PDD_PUBLISH_URL
-    out_dir = Path(BASE_DIR) / PDD_DEBUG_DIR / f"probe-{time.strftime('%Y%m%d-%H%M%S')}"
+    # 报告落在 `screenshots/pdd/probe-<时间戳>/`（和发布失败的现场同一个平台目录，
+    # 排查时只看 `screenshots/<平台>/` 一处）。
+    out_dir = evidence.platform_dir("pdd") / f"probe-{time.strftime('%Y%m%d-%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"🌐 目标: {url}")

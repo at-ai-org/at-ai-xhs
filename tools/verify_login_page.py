@@ -36,10 +36,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from conf import BASE_DIR  # noqa: F401,E402  # 导入它会把 PLAYWRIGHT_BROWSERS_PATH 指到项目内的 .browsers/
+import myUtils.publish_evidence as evidence  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
-SHOT_DIR = Path("screenshots")
-SHOT_DIR.mkdir(exist_ok=True)
+# 截图落点统一由 myUtils/publish_evidence 决定：发布失败的现场在
+# `screenshots/<平台>/`，验收脚本的图放 `screenshots/tools/`（免得混着看）。
+SHOT_DIR = evidence.platform_dir("tools")
 
 #: 与 sau_frontend/src/utils/session.js 里的 TOKEN_KEY 保持一致。
 #: 这里刻意写死：脚本就是要盯住这个"前后端的约定"，改名字了两边都得改，测试该红。

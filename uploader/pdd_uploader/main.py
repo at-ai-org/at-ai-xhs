@@ -52,7 +52,7 @@
 `video-list_success` 其实是"上传成功"这些坑，详见 `docs/拼多多视频接入方案.md` 的 1.6 节）。
 平台改版后仍可随时复检：
 打开 `SAU_PDD_DUMP=1`（或 `conf.py` 里把 `PDD_DEBUG_DUMP` 设为 True）会记录每一步的
-HTML + 全页截图到 `pdd_debug/`；更直接的是先跑
+HTML + 全页截图到 `screenshots/pdd/`；更直接的是先跑
 `tools/verify_pdd_publish_page.py`（逐条试候选选择器并给报告）。
 流程逻辑本身不依赖真实页面，已经由 `tools/verify_pdd_publish_flow_offline.py`
 （本地假发布页 + 真实驱动，7 个场景）覆盖。
@@ -73,13 +73,11 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import BASE_DIR
 from conf import LOCAL_CHROME_PATH
 from conf import PDD_CONTENT_DECLARATION
 from conf import PDD_COVER_MAX_MB
 from conf import PDD_COVER_MIN_WIDTH
 from conf import PDD_COVER_RATIO
-from conf import PDD_DEBUG_DIR
 from conf import PDD_DEBUG_DUMP
 from conf import PDD_DESC_MAX
 from conf import PDD_HEADLESS
@@ -92,6 +90,7 @@ from conf import PDD_VIDEO_HINT
 from conf import PDD_UPLOAD_STALL_SECONDS
 from conf import PDD_TOPIC_MAX
 from conf import PDD_TOPIC_MAX_COUNT
+import myUtils.publish_evidence as evidence
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.log import pdd_logger
@@ -107,6 +106,14 @@ PDD_NAV_ATTEMPTS = 2
 PDD_UPLOAD_ENTRY_TIMEOUT_MS = 90_000
 PDD_UPLOAD_ENTRY_ATTEMPTS = 2
 PDD_SUBMIT_TIMEOUT_MS = 60_000
+#: 等「发布」按钮**变成可点**的上限。
+#:
+#: 按钮可见 ≠ 可点：平台把视频收下之后还要自己"处理/转码"一会儿，这期间发布按钮是
+#: 禁用态的（`BTN_disabled_*`）。原来拿到可见按钮就直接 click()，Playwright 默认只等
+#: 30 秒就放弃，报出来的是一大段 "element is not enabled" 的点击重试日志——
+#: 既看不出"平台还没处理完"，也把本来只是慢一点的那次发布判成了失败。
+#: 真机上（一轮 4 个平台同时发、机器负载 40 的时候）这一步经常要一两分钟。
+PDD_SUBMIT_READY_TIMEOUT_MS = 180_000
 #: 点「发布」之后的"冷静期"：期间不下任何结论，只看页面有没有报错。
 #: ⚠️ 这个值必须**远小于平台提示的存活时间**：平台的警告（`c.default.warn(..., 2000)`）
 #: 大约只显示 2 秒，原来设的 6 秒会让"点完先睡 6 秒再检查"永远读不到那句提示——
@@ -293,45 +300,45 @@ def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
 
 
+#: 错误信息里给用户看的现场路径（`screenshots/pdd/`）。发布失败时 `_publish` 的
+#: 兜底分支一定会往这里落一份现场，所以这条提示在任何失败路径上都是真的。
+PDD_EVIDENCE_HINT = evidence.dir_hint("pdd")
+
+
 # --------------------------------------------------------------------------- #
 # 调试取证：每一步都能落一份现场
 # --------------------------------------------------------------------------- #
+#
+# 落点统一由 `myUtils/publish_evidence` 决定：`screenshots/pdd/`。原来这里是自己
+# 一个 `pdd_debug/` 外层目录，和另外四个平台的 `screenshots/` 分家——同一个发布中心
+# 的失败现场散在两处，排查时先得想起"拼多多那个在别的地方"。
 
 
 def _debug_dir() -> Path:
-    path = Path(BASE_DIR) / PDD_DEBUG_DIR
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """现场目录（`screenshots/pdd/`），顺手建出来。"""
+    return evidence.platform_dir("pdd")
 
 
 async def _dump(page: Page, tag: str) -> str:
-    """把当前页面的 HTML + 全页截图落到 `pdd_debug/`，返回目录路径（失败返回空串）。
+    """把当前页面的 HTML + 全页截图落到 `screenshots/pdd/`，返回路径前缀（失败返回空串）。
 
     **这个函数自己绝不允许把发布搞失败**（和快手那条路同一个教训）：截图前 Playwright
     会等 `document.fonts.ready`，机器忙的时候能一直撞到 30 秒默认超时；取证是有界的副产物，
     不是发布的一环。所以：自己的超时 + 自己的 try，异常只记日志。
     """
-    try:
-        base = _debug_dir()
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        prefix = base / f"{stamp}-{tag}"
-        try:
-            (prefix.with_suffix(".html")).write_text(await page.content(), encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001
-            pdd_logger.warning(_msg("📸", f"存 HTML 失败（不影响发布）: {exc}"))
-        try:
-            await page.screenshot(
-                path=str(prefix.with_suffix(".png")),
-                full_page=True,
-                timeout=PDD_DEBUG_SHOT_TIMEOUT_MS,
-            )
-        except Exception as exc:  # noqa: BLE001
-            pdd_logger.warning(_msg("📸", f"存截图失败（不影响发布）: {exc}"))
-        pdd_logger.warning(_msg("📸", f"已保存现场: {prefix}.html / .png（url={page.url}）"))
-        return str(prefix)
-    except Exception as exc:  # noqa: BLE001
-        pdd_logger.warning(_msg("📸", f"保存现场失败（不影响发布）: {exc}"))
+    png = await evidence.capture(
+        page,
+        "pdd",
+        tag,
+        logger=pdd_logger,
+        html=True,
+        timeout_ms=PDD_DEBUG_SHOT_TIMEOUT_MS,
+    )
+    if not png:
         return ""
+    prefix = Path(png).with_suffix("")
+    pdd_logger.warning(_msg("📸", f"现场文件（url={page.url}）: {prefix}.png / .html"))
+    return str(prefix)
 
 
 async def _dump_if_enabled(page: Page, tag: str) -> None:
@@ -529,7 +536,7 @@ async def _ensure_upload_page(page: Page) -> None:
     await _dump(page, "not-upload-page")
     raise RuntimeError(
         "打开的不是拼多多的上传页（既没有视频上传输入框，也没有「添加视频」按钮）。"
-        f"当前地址：{page.url}。现场已存到 {PDD_DEBUG_DIR}/。"
+        f"当前地址：{page.url}。现场已存到 {PDD_EVIDENCE_HINT}。"
     )
 
 
@@ -598,7 +605,7 @@ async def _wait_publish_page_ready(page: Page) -> None:
     raise RuntimeError(
         f"拼多多发布页等不到上传入口（{PDD_UPLOAD_ENTRY_TIMEOUT_MS / 1000:g} 秒 × "
         f"{PDD_UPLOAD_ENTRY_ATTEMPTS} 次），疑似页面改版或登录态异常。"
-        f"现场已存到 {PDD_DEBUG_DIR}/，请据此核对 PDD_SELECTORS。{last_error or ''}"
+        f"现场已存到 {PDD_EVIDENCE_HINT}，请据此核对 PDD_SELECTORS。{last_error or ''}"
     )
 
 
@@ -628,7 +635,7 @@ async def _set_video_file(page: Page, file_path: str) -> None:
         await _dump(page, "no-file-input")
         raise RuntimeError(
             "找不到上传视频的入口（既没有 input[type=file]，也没有「添加视频」按钮）。"
-            f"现场已存到 {PDD_DEBUG_DIR}/。"
+            f"现场已存到 {PDD_EVIDENCE_HINT}。"
         )
     async with page.expect_file_chooser() as fc_info:
         await button.click()
@@ -771,7 +778,7 @@ async def _wait_upload_finished(page: Page, file_path: str) -> None:
     raise RuntimeError(
         f"平台侧上传没完成：文件已经选中，但 {PDD_UPLOAD_STALL_SECONDS} 秒内平台始终没有把视频收下"
         f"（已自动重传 {PDD_UPLOAD_RETRIES} 次）。这不是本地文件的问题，多半是平台那一次上传/转码"
-        f"没有响应——过一会儿重发即可。现场已存到 {PDD_DEBUG_DIR}/。"
+        f"没有响应——过一会儿重发即可。现场已存到 {PDD_EVIDENCE_HINT}。"
     )
 
 
@@ -793,7 +800,7 @@ async def _fill_desc(page: Page, text: str) -> bool:
     if editor is None:
         await _dump(page, "no-desc-editor")
         raise RuntimeError(
-            f"找不到「描述」编辑器（富文本 contenteditable）。现场已存到 {PDD_DEBUG_DIR}/，"
+            f"找不到「描述」编辑器（富文本 contenteditable）。现场已存到 {PDD_EVIDENCE_HINT}，"
             f"请据此核对 PDD_SELECTORS 里的 desc_editor。"
         )
 
@@ -935,10 +942,12 @@ def _auto_cover_frame(video_path: str) -> str | None:
     而且这一步用的 ffmpeg 是仓库里已有的（`imageio-ffmpeg` 自带静态二进制，
     见 `uploader/xiaohongshu_uploader/ai_copywriter.py` 的 `extract_key_frames`）。
 
-    生成结果缓存在 `pdd_debug/covers/`（按视频文件名），同一素材重发不用反复抽帧。
+    生成结果缓存在 `screenshots/pdd/covers/`（按视频文件名），同一素材重发不用反复抽帧。
+    它跟着现场目录走是因为**这个目录归拼多多这条链路专用**、且已在 `.gitignore` 里
+    （生成物本来也不该入库）；单独再起一个外层目录只多一个要记住的路径。
     """
     video = Path(video_path)
-    out_dir = Path(BASE_DIR) / PDD_DEBUG_DIR / "covers"
+    out_dir = _debug_dir() / "covers"
     out_dir.mkdir(parents=True, exist_ok=True)
     cached = out_dir / f"{video.stem}.jpg"
     if cached.is_file() and cached.stat().st_size > 0:
@@ -1163,7 +1172,7 @@ async def _set_schedule(page: Page, publish_date: datetime) -> None:
     if option is None:
         await _dump(page, "no-schedule-option")
         raise RuntimeError(
-            f"找不到「定时发布」选项，无法按时发布（拒绝降级为立即发布）。现场已存到 {PDD_DEBUG_DIR}/。"
+            f"找不到「定时发布」选项，无法按时发布（拒绝降级为立即发布）。现场已存到 {PDD_EVIDENCE_HINT}。"
         )
     await option.click()
     await asyncio.sleep(1)
@@ -1176,7 +1185,7 @@ async def _set_schedule(page: Page, publish_date: datetime) -> None:
     if time_input is None:
         await _dump(page, "no-schedule-input")
         raise RuntimeError(
-            f"点了「定时发布」但找不到时间输入框。现场已存到 {PDD_DEBUG_DIR}/，请据此核对定时控件。"
+            f"点了「定时发布」但找不到时间输入框。现场已存到 {PDD_EVIDENCE_HINT}，请据此核对定时控件。"
         )
 
     # 格式对齐真机：点「定时发布」后那个输入框自带的值形如 `2026-10-08 16:42:40`（**带秒**），
@@ -1399,7 +1408,31 @@ async def _submit(page: Page) -> None:
     button = await _first_visible(page, PDD_SELECTORS["submit_button"], timeout_ms=30_000)
     if button is None:
         await _dump(page, "no-submit-button")
-        raise RuntimeError(f"找不到「发布」按钮。现场已存到 {PDD_DEBUG_DIR}/。")
+        raise RuntimeError(f"找不到「发布」按钮。现场已存到 {PDD_EVIDENCE_HINT}。")
+
+    # 可见 ≠ 可点：平台收下视频后还要"处理/转码"一会儿，这期间按钮是禁用态的。
+    # 显式等它变可点（而不是让 click() 用默认的 30 秒去撞），等不到就把原因说清楚——
+    # 失败信息里必须能看出"是平台还在处理"，而不是一串 element is not enabled。
+    #
+    # 轮询而不是 `expect(...).to_be_enabled()`：后者只认真实 Locator，离线自测用的假元素
+    # 喂不进去（`ValueError: Unsupported type`），会把一批本来在验"点发布之后怎么判读"
+    # 的用例一起打掉。这里只要能问出 is_disabled 就行。
+    ready_deadline = time.monotonic() + PDD_SUBMIT_READY_TIMEOUT_MS / 1000
+    while True:
+        try:
+            disabled = await button.is_disabled()
+        except Exception:  # noqa: BLE001
+            # 问不出状态（元素已经没了，或自测里的假元素）：不在这里卡着，交给 click 去报
+            disabled = False
+        if not disabled:
+            break
+        if time.monotonic() >= ready_deadline:
+            await _dump(page, "submit-disabled")
+            raise RuntimeError(
+                f"「发布」按钮 {PDD_SUBMIT_READY_TIMEOUT_MS / 1000:.0f} 秒内一直不可点"
+                f"（平台还没处理完这条视频，或这一条被平台卡住了）。现场已存到 {PDD_EVIDENCE_HINT}。"
+            )
+        await asyncio.sleep(1)
 
     # 先装监听再点：发布接口可能很快返回，先点后装会漏掉。
     responses: list = []
@@ -1498,7 +1531,7 @@ async def _submit(page: Page) -> None:
         await _dump(page, "submit-timeout")
         raise RuntimeError(
             "点了发布但等不到任何回执（接口没响、卡片状态没变、也没有错误提示），结论未知——"
-            f"请到拼多多创作后台用「内容管理」核对是否已发布。现场已存到 {PDD_DEBUG_DIR}/。"
+            f"请到拼多多创作后台用「内容管理」核对是否已发布。现场已存到 {PDD_EVIDENCE_HINT}。"
         )
     finally:
         try:
@@ -1742,7 +1775,7 @@ class PddVideo(BaseVideoUploader):
                 # 比"这次失败"更难收拾。
                 raise RuntimeError(
                     "描述没有写进发布页编辑器（内容对不上），已停止发布。"
-                    f"现场已存到 {PDD_DEBUG_DIR}/，请把该目录给我核对编辑器选择器。"
+                    f"现场已存到 {PDD_EVIDENCE_HINT}，请把该目录给我核对编辑器选择器。"
                 )
             self._record(
                 "fill_form", "ok",
@@ -1794,7 +1827,9 @@ class PddVideo(BaseVideoUploader):
             try:
                 page = context.pages[-1] if context.pages else None
                 if page is not None:
-                    await _dump(page, "failed")
+                    # 标签带上素材名，和另外四个平台一致：同平台多账号并行跑时，
+                    # 光看 `-failed` 分不出这张图是哪条素材的。
+                    await _dump(page, f"{Path(self.file_path).stem}-publish-failed")
             except Exception:  # noqa: BLE001
                 pass
             raise

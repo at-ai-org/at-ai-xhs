@@ -45,10 +45,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from conf import BASE_DIR  # noqa: F401,E402  # 导入它会把 PLAYWRIGHT_BROWSERS_PATH 指到项目内的 .browsers/
+import myUtils.publish_evidence as evidence  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
-SHOT_DIR = ROOT / "screenshots"
-SHOT_DIR.mkdir(exist_ok=True)
+# 截图落点统一由 myUtils/publish_evidence 决定：发布失败的现场在
+# `screenshots/<平台>/`，验收脚本的图放 `screenshots/tools/`（免得混着看）。
+SHOT_DIR = evidence.platform_dir("tools")
 
 VIEWPORT = {"width": 1680, "height": 1000}
 
@@ -97,6 +99,11 @@ def build_sandbox(root: Path) -> Path:
         "sau_backend_xhs.py",
         "sau_backend_music.py",
         "sau_backend_publish.py",
+        # sau_backend.py 在 import 阶段就会拉这两个蓝图（账号会话续期、账号数据详情），
+        # 漏掉任何一个，沙箱里的后端起不来——报的是 `No module named 'sau_backend_session'`，
+        # 而脚本只会说"后端在 90s 内没起来"。以后再加 sau_backend_*.py 记得补这里。
+        "sau_backend_session.py",
+        "sau_backend_stats.py",
         "sau_cli.py",
         "myUtils",
         "utils",

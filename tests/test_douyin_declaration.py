@@ -68,10 +68,16 @@ class DouyinDeclarationTests(unittest.TestCase):
         locator = MagicMock()
         locator.set_input_files = AsyncMock()
         locator.count = AsyncMock(return_value=1)
+        locator.wait_for = AsyncMock()
+        locator.first = locator  # `page.locator(...).first` 还是这个 locator（否则 await count() 会炸）
         page = MagicMock()
         page.goto = AsyncMock()
         page.wait_for_url = AsyncMock()
         page.wait_for_selector = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        # 失败取证会拍一张现场图（进 `screenshots/douyin/`）：这里让它故意失败，
+        # 顺带钉住"取证截图失败也绝不影响发布/收尾"这条契约。
+        page.screenshot = AsyncMock(side_effect=TimeoutError("waiting for fonts to load"))
         page.locator.return_value = locator
 
         context = MagicMock()

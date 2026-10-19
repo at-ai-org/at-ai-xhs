@@ -15,6 +15,7 @@ from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_PATH
+import myUtils.publish_evidence as evidence
 from uploader.base_video import BaseVideoUploader
 # 视频号会话层：持久化 profile + 每条路径回写 cookie + 登录/校验/发布共用启动参数。
 # 登录、校验、发布三处都必须走它，不要再自己 launch + new_context —— 那正是
@@ -35,6 +36,34 @@ TENCENT_UPLOAD_URL = "https://channels.weixin.qq.com/platform/post/create"
 TENCENT_MANAGE_URL = "https://channels.weixin.qq.com/platform/post/list"
 TENCENT_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 TENCENT_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+
+#: 算"等上传完成"的上限时假定的最慢上行（字节/秒）。
+#: 取 0.5Mbps —— 就是 `wait_for_upload_complete` 注释里那个实测过的坏网速。
+_UPLOAD_ASSUMED_BYTES_PER_SEC = 64 * 1024
+#: 小文件的等待下限：再快也要给平台留出"收下 + 处理"的时间。
+_UPLOAD_MIN_TIMEOUT_SECONDS = 300
+#: 大文件的上限（和原来的默认值一致）：慢网络上大文件确实要传很久。
+_UPLOAD_MAX_TIMEOUT_SECONDS = 3600
+
+
+def upload_timeout_for(file_path: str | Path) -> int:
+    """按素材大小给"等上传完成"定一个上限。
+
+    **小文件不该享受大文件那么长的等待。** 真机上（一轮 4 个平台同时发、机器负载 40）
+    碰到过一个 **1.3MB** 的视频在页面上"上传中"停了 13 分钟：文件早传完了，
+    卡住的是平台侧（「发表」按钮一直不可用）。而这条任务**占着这个账号的通道**，
+    后面十几条视频号任务全被它堵着，一直到 30 分钟看门狗才被掐掉——
+    用户看到的就是"卡住了"。
+
+    按大小给下限就合理了：1.3MB 最多等 5 分钟，13MB 约 5 分钟，172MB 仍然有 45 分钟。
+    真的在慢慢传的大文件不受影响，卡住的小文件则能早点失败、把通道让出来。
+    """
+    try:
+        size = Path(file_path).stat().st_size
+    except OSError:
+        return _UPLOAD_MAX_TIMEOUT_SECONDS
+    estimate = size / _UPLOAD_ASSUMED_BYTES_PER_SEC + 120
+    return int(min(_UPLOAD_MAX_TIMEOUT_SECONDS, max(_UPLOAD_MIN_TIMEOUT_SECONDS, estimate)))
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -721,17 +750,12 @@ class TencentBaseUploader(BaseVideoUploader):
         if fi is None:
             # 留现场：这个错误的可能原因太多（没登录 / 落到首页 / iframe 没加载完 /
             # 平台改版），只看错误字符串没法区分，截图能一眼看出是哪种。
-            try:
-                shot = Path(BASE_DIR) / "debug_tencent_no_file_input.png"
-                await page.screenshot(path=str(shot), full_page=True)
-                tencent_logger.info(_msg(
-                    "📸",
-                    f"失败现场已截图 {shot}; url={page.url}; "
-                    f"frames={[fr.url[:80] for fr in page.frames]}",
-                ))
-            except Exception:
-                pass
-            raise RuntimeError("未找到视频号文件上传框")
+            await evidence.capture(page, "tencent", "no-file-input", logger=tencent_logger)
+            tencent_logger.info(_msg(
+                "📸",
+                f"失败现场 url={page.url}; frames={[fr.url[:80] for fr in page.frames]}",
+            ))
+            raise RuntimeError(f"未找到视频号文件上传框，{evidence.describe('tencent', 'no-file-input')}")
         await fi.set_input_files(file_path)
 
     async def set_short_title(self, page: Page, title: str, short_title: str | None = None) -> None:
@@ -891,20 +915,17 @@ class TencentBaseUploader(BaseVideoUploader):
 
         默认 1 小时 / 3 次重试：慢网络上大文件确实会传很久，上限要给够；
         但到点、或者重试用完，就带现场截图明确报错，不要静默地转下去。
+        小文件的实际上限由 `upload_timeout_for()` 按大小收紧，调用方传进来。
         """
         deadline = time.monotonic() + timeout_seconds
         last_report = 0.0
         retries = 0
         while True:
             if time.monotonic() > deadline:
-                try:
-                    shot = Path(BASE_DIR) / "debug_tencent_upload_timeout.png"
-                    await page.screenshot(path=str(shot), full_page=True)
-                    tencent_logger.error(_msg("📸", f"上传超时现场已截图 {shot}"))
-                except Exception:
-                    pass
+                await evidence.capture(page, "tencent", "upload-timeout", logger=tencent_logger)
                 raise RuntimeError(
                     f"视频号上传超过 {timeout_seconds} 秒仍未完成（「发表」按钮一直不可用）"
+                    f"，{evidence.describe('tencent', 'upload-timeout')}"
                 )
             try:
                 publish_button = page.locator('div.form-btns button:has-text("发表"):visible').first
@@ -931,15 +952,13 @@ class TencentBaseUploader(BaseVideoUploader):
                 if upload_failed and delete_button:
                     retries += 1
                     if retries > max_retries:
-                        try:
-                            shot = Path(BASE_DIR) / "debug_tencent_upload_failed.png"
-                            await page.screenshot(path=str(shot), full_page=True)
-                            tencent_logger.error(_msg("📸", f"上传反复失败，现场已截图 {shot}"))
-                        except Exception:
-                            pass
+                        await evidence.capture(
+                            page, "tencent", "upload-failed", logger=tencent_logger
+                        )
                         raise RuntimeError(
                             f"视频号上传连续失败 {max_retries} 次，已停止重试"
                             "（常见原因：文件过大、上行带宽太慢导致平台侧超时，或走了代理/VPN）"
+                            f"，{evidence.describe('tencent', 'upload-failed')}"
                         )
                     tencent_logger.error(_msg("😵", f"发现上传出错了，准备重试（第 {retries}/{max_retries} 次）"))
                     await self.handle_upload_error(page)
@@ -1184,22 +1203,32 @@ class TencentVideo(TencentBaseUploader):
         async with tencent_session(playwright, self.account_file, headless=self.headless) as session:
             context = session.context
             page = await context.new_page()
-            await self.open_upload_page(page)
-            tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
+            try:
+                await self.open_upload_page(page)
+                tencent_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}"))
 
-            await self.upload_video_file(page, self.file_path)
-            await self.prepare_video_for_publish(page)
-            await self.wait_for_upload_complete(page)
-            # 上传完成、表单稳定后再选合集（否则上传中选的会被重置）
-            await self.apply_collection(page)
-            await self.apply_original_statement(page)
-            await self.set_thumbnail(page)
+                await self.upload_video_file(page, self.file_path)
+                await self.prepare_video_for_publish(page)
+                await self.wait_for_upload_complete(page, timeout_seconds=upload_timeout_for(self.file_path))
+                # 上传完成、表单稳定后再选合集（否则上传中选的会被重置）
+                await self.apply_collection(page)
+                await self.apply_original_statement(page)
+                await self.set_thumbnail(page)
 
-            if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
-                await self.set_schedule_time_tencent(page, self.publish_date)
+                if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+                    await self.set_schedule_time_tencent(page, self.publish_date)
 
-            await self.set_short_title(page, self.title, self.short_title)
-            await self.submit_publish(page)
+                await self.set_short_title(page, self.title, self.short_title)
+                await self.submit_publish(page)
+            except Exception:
+                # **失败必须留现场**：原来只有"找不到上传框 / 上传超时 / 上传反复失败"
+                # 这三处各拍一张、还都散在仓库根目录（`debug_tencent_*.png`）。
+                # 这里是无条件的最后一道，任何一步失败都落进 `screenshots/tencent/`。
+                await evidence.capture(
+                    page, "tencent", f"{Path(self.file_path).stem}-publish-failed",
+                    logger=tencent_logger,
+                )
+                raise
         tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
 
     async def tencent_upload_video(self):

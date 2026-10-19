@@ -179,17 +179,11 @@ logs/
 .run/
 *.pid
 
-# 本地素材与调试截图（体积大，不入库）
+# 本地素材与全部调试截图（体积大，不入库）。发布失败的现场按平台分在
+# screenshots/<平台>/ 下，选择器核对报告和自动生成的封面帧也在里面，
+# 落点由 myUtils/publish_evidence.py 统一决定。
 screenshots/
 videos/
-
-# 快手发布入口找不到时抓的现场（页面 HTML + 截图）。运行时产物，见
-# uploader/ks_uploader/main.py 的 _dump_page_debug()
-ks_debug/
-
-# 拼多多发布每一步的现场（HTML + 截图）+ 自动生成的封面帧。运行时产物，见
-# uploader/pdd_uploader/main.py 的 _dump()
-pdd_debug/
 
 # 登录过程中生成的临时二维码图片
 cookiesFile/*_login_qrcode_*.png

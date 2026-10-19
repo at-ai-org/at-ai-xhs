@@ -44,12 +44,112 @@ def _page(url: str = "https://cp.kuaishou.com/article/publish/video"):
     return page
 
 
+class _FakePlaywright:
+    """把 `async_playwright()` 换掉：给一个只会返回我们那张假页面的浏览器。"""
+
+    def __init__(self, page):
+        self._page = page
+
+    def __call__(self):
+        page = self._page
+
+        class _Chromium:
+            async def launch(self, **_kwargs):
+                browser = MagicMock()
+                browser.close = AsyncMock()
+                context = MagicMock()
+                context.new_page = AsyncMock(return_value=page)
+                browser.new_context = AsyncMock(return_value=context)
+                return browser
+
+        class _CM:
+            async def __aenter__(self):
+                pw = MagicMock()
+                pw.chromium = _Chromium()
+                return pw
+
+            async def __aexit__(self, *_a):
+                return False
+
+        return _CM()
+
+
+def _auth_page(url="https://cp.kuaishou.com/article/publish/video", *, login_button=False, entry_ok=True):
+    page = MagicMock()
+    page.url = url
+    page.wait_for_timeout = AsyncMock()
+    page.get_by_text = MagicMock(
+        return_value=MagicMock(count=AsyncMock(return_value=1 if login_button else 0))
+    )
+    button = MagicMock()
+    button.wait_for = (
+        AsyncMock() if entry_ok else AsyncMock(side_effect=RuntimeError("Timeout 25000ms exceeded"))
+    )
+    page.locator = MagicMock(return_value=button)
+    return page
+
+
+class KuaishouCookieAuthTests(unittest.TestCase):
+    """「打不开 / 页面慢」**不等于**「登录态失效」。
+
+    以前这两种情况都让 `cookie_auth()` 返回 False，调用方于是报
+    「cookie文件已失效，请先完成快手登录」——网络一抖就把人骗去重新扫码，
+    而账号其实是好的（真机上：一轮 4 个平台同时发，快手连着报了好几条这种）。
+
+    分工要清楚：
+
+    * **有证据**说未登录（跳 passport、页面出现「立即登录」、机构服务页）→ False；
+    * **只是打不开/没渲染出来**（页面上没有任何未登录迹象）→ 抛 `KsPageUnreachable`，
+      调用方报"打不开、账号和登录态都没问题"，用户重跑一次就好。
+    """
+
+    def _run(self, page, *, goto_error=None, cookie_invalid=False):
+        for p in (
+            patch.object(ks_main, "async_playwright", _FakePlaywright(page)),
+            patch.object(ks_main, "set_init_script", AsyncMock(side_effect=lambda ctx: ctx)),
+            patch.object(ks_main, "_is_ks_cookie_invalid", AsyncMock(return_value=cookie_invalid)),
+            patch.object(ks_main, "_goto_ks_page", AsyncMock(side_effect=goto_error)),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_navigation_failure_is_not_a_cookie_problem(self):
+        page = _auth_page()
+        self._run(page, goto_error=RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED"))
+
+        with self.assertRaises(ks_main.KsPageUnreachable):
+            asyncio.run(ks_main.cookie_auth("fake.json"))
+
+    def test_slow_page_without_login_evidence_is_not_a_cookie_problem(self):
+        """页面打开了、也没说未登录，只是上传入口一直没渲染出来——多半是机器忙。"""
+        page = _auth_page(entry_ok=False)
+        self._run(page)
+
+        with self.assertRaises(ks_main.KsPageUnreachable):
+            asyncio.run(ks_main.cookie_auth("fake.json"))
+
+    def test_redirect_to_passport_means_really_expired(self):
+        page = _auth_page(url="https://passport.kuaishou.com/pc/account/login/?sid=x")
+        self._run(page)
+        self.assertIs(asyncio.run(ks_main.cookie_auth("fake.json")), False)
+
+    def test_login_button_means_really_expired(self):
+        page = _auth_page(login_button=True)
+        self._run(page)
+        self.assertIs(asyncio.run(ks_main.cookie_auth("fake.json")), False)
+
+    def test_upload_entry_means_valid(self):
+        page = _auth_page()
+        self._run(page)
+        self.assertIs(asyncio.run(ks_main.cookie_auth("fake.json")), True)
+
+
 class KuaishouUploadEntryTests(unittest.TestCase):
     def test_button_appearing_late_is_not_a_failure(self):
         """按钮慢一两拍才出现（并发跑多个浏览器时的常态）→ 等它，不要判死。"""
         locator = _Locator(invisible_times=1)
         with patch.object(ks_main.asyncio, "sleep", AsyncMock()), patch.object(
-            ks_main, "_dump_page_debug", AsyncMock(return_value="ks_debug/fake")
+            ks_main, "_dump_page_debug", AsyncMock(return_value="screenshots/kuaishou/fake")
         ) as dump:
             asyncio.run(
                 ks_main._wait_upload_entry(_page(), locator, what="「上传视频」按钮", timeout_ms=2000)
@@ -69,9 +169,9 @@ class KuaishouUploadEntryTests(unittest.TestCase):
         locator = _Locator(invisible_times=10**6)
         on_retry = AsyncMock()
         with patch.object(ks_main.asyncio, "sleep", AsyncMock()), patch.object(
-            ks_main, "_dump_page_debug", AsyncMock(return_value="ks_debug/fake")
+            ks_main, "_dump_page_debug", AsyncMock(return_value="screenshots/kuaishou/fake")
         ) as dump:
-            with self.assertRaisesRegex(RuntimeError, "ks_debug/fake"):
+            with self.assertRaisesRegex(RuntimeError, "screenshots/kuaishou/fake"):
                 asyncio.run(
                     ks_main._wait_upload_entry(
                         _page(),
@@ -91,7 +191,7 @@ class KuaishouUploadEntryTests(unittest.TestCase):
         locator = _Locator(invisible_times=10**6)
         page = _page()
         with patch.object(ks_main.asyncio, "sleep", AsyncMock()), patch.object(
-            ks_main, "_dump_page_debug", AsyncMock(return_value="ks_debug/fake")
+            ks_main, "_dump_page_debug", AsyncMock(return_value="screenshots/kuaishou/fake")
         ), patch.object(ks_main, "_switch_to_note_tab", AsyncMock()) as switch:
             with self.assertRaises(RuntimeError):
                 asyncio.run(

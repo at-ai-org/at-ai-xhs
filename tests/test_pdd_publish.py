@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import conf
+import myUtils.publish_evidence as evidence
 from uploader import pdd_uploader
 from uploader.pdd_uploader import main as pdd_main
 
@@ -309,47 +310,64 @@ class PddValidateTests(unittest.TestCase):
 class PddCoverTests(unittest.TestCase):
     """封面：拼多多没有封面不许发布，所以"抽首帧兜底"这条路必须可靠、且不重复劳动。"""
 
-    def test_cached_cover_is_reused_without_touching_ffmpeg(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            video = Path(tmp) / "素材.mp4"
-            video.write_bytes(b"fake")
-            covers = Path(tmp) / "covers"
-            covers.mkdir()
-            cached = covers / "素材.jpg"
-            cached.write_bytes(b"already-a-cover")
+    def setUp(self):
+        # 封面缓存跟着现场目录走（`screenshots/pdd/covers/`，落点由
+        # myUtils/publish_evidence 决定）。这里把现场根换到临时目录，
+        # 测试不去碰仓库里真实的 screenshots/。
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        patcher = patch.object(evidence, "evidence_root", lambda: self.tmp / "screenshots")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-            # PDD_DEBUG_DIR 置空：函数内部再拼一层 "covers"，这里就让它正好落在 tmp/covers。
-            with patch.object(pdd_main, "BASE_DIR", tmp), patch.object(
-                pdd_main, "PDD_DEBUG_DIR", ""
-            ), patch(
-                "uploader.xiaohongshu_uploader.ai_copywriter.extract_key_frames"
-            ) as extract:
-                self.assertEqual(pdd_main._auto_cover_frame(str(video)), str(cached))
-                # 有缓存就不该再去抽帧（抽一次要跑 ffmpeg，是发布路上的纯开销）
-                extract.assert_not_called()
+    def _covers_dir(self) -> Path:
+        return evidence.platform_dir("pdd") / "covers"
+
+    def test_cache_lands_under_the_platform_evidence_dir(self):
+        """缓存目录必须落在 `screenshots/pdd/covers/`，不能又冒出一个外层目录。"""
+        self.assertEqual(
+            self._covers_dir(),
+            self.tmp / "screenshots" / "pdd" / "covers",
+        )
+
+    def test_cached_cover_is_reused_without_touching_ffmpeg(self):
+        video = self.tmp / "素材.mp4"
+        video.write_bytes(b"fake")
+        covers = self._covers_dir()
+        covers.mkdir(parents=True)
+        cached = covers / "素材.jpg"
+        cached.write_bytes(b"already-a-cover")
+
+        with patch(
+            "uploader.xiaohongshu_uploader.ai_copywriter.extract_key_frames"
+        ) as extract:
+            self.assertEqual(pdd_main._auto_cover_frame(str(video)), str(cached))
+            # 有缓存就不该再去抽帧（抽一次要跑 ffmpeg，是发布路上的纯开销）
+            extract.assert_not_called()
 
     def test_extraction_failure_is_not_fatal(self):
         """抽帧失败只该返回 None（由页面校验兜底报错），不能让发布在本地就炸掉。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            video = Path(tmp) / "素材.mp4"
-            video.write_bytes(b"fake")
-            with patch.object(pdd_main, "BASE_DIR", tmp), patch.object(
-                pdd_main, "PDD_DEBUG_DIR", ""
-            ), patch(
-                "uploader.xiaohongshu_uploader.ai_copywriter.extract_key_frames",
-                side_effect=RuntimeError("ffmpeg 不在"),
-            ):
-                self.assertIsNone(pdd_main._auto_cover_frame(str(video)))
+        video = self.tmp / "素材.mp4"
+        video.write_bytes(b"fake")
+        with patch(
+            "uploader.xiaohongshu_uploader.ai_copywriter.extract_key_frames",
+            side_effect=RuntimeError("ffmpeg 不在"),
+        ):
+            self.assertIsNone(pdd_main._auto_cover_frame(str(video)))
 
 
 class _FakeLocator:
     """模拟 Playwright 的 Locator：同一选择器下可能有多个元素，只有部分可见。"""
 
-    def __init__(self, visibilities: list[bool], value: str = "", page=None):
+    def __init__(self, visibilities: list[bool], value: str = "", page=None, disabled: bool = False):
         self._vis = visibilities
         self._value = value
         self.clicked = False
         self.page = page
+        #: 按钮"可见但不可点"（平台还在处理这条视频时就是这样）
+        self.disabled = disabled
+        self.disabled_reads = 0
 
     async def count(self) -> int:
         return len(self._vis)
@@ -378,6 +396,10 @@ class _FakeElement:
 
     async def input_value(self) -> str:
         return self._owner._value
+
+    async def is_disabled(self) -> bool:
+        self._owner.disabled_reads += 1
+        return self._owner.disabled
 
 
 class _FakePage:
@@ -425,6 +447,29 @@ class _FakePage:
 
 class PddPageInteractionTests(unittest.TestCase):
     """离线自测抓出来的两个真 bug，在这里钉死。"""
+
+    def test_disabled_publish_button_is_waited_for_not_failed_instantly(self):
+        """按钮"可见但不可点"≠ 失败：平台收下视频后还要处理一会儿。
+
+        原来直接 click()，Playwright 默认等 30 秒就放弃，报出来是一串
+        `element is not enabled` —— 真机上（一轮 4 个平台同时发、机器负载 40）
+        这一步经常要一两分钟，于是本来只是慢的那次发布被判成了失败。
+        现在会显式等它变可点；到点还不可点才失败，并且说清楚是"平台还没处理完"。
+        """
+        import asyncio
+        from unittest.mock import patch
+
+        locator = _FakeLocator([True], disabled=True)
+        page = _FakePage()
+        page.selectors['[class*="singlePublish"] button'] = locator
+
+        with patch.object(pdd_main, "PDD_SUBMIT_READY_TIMEOUT_MS", 0), patch.object(
+            pdd_main, "_dump", AsyncMock()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "一直不可点"):
+                asyncio.run(pdd_main._submit(page))
+
+        self.assertGreaterEqual(locator.disabled_reads, 1, "至少要知道它是不可点的")
 
     def test_first_visible_skips_hidden_matches(self):
         """`.first` 是"DOM 顺序第一个"，不是"第一个可见的"。

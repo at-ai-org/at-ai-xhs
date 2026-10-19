@@ -12,6 +12,7 @@ from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+import myUtils.publish_evidence as evidence
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.files_times import get_absolute_path
@@ -65,8 +66,9 @@ KUAISHOU_NAV_ATTEMPTS = 2
 # 默认的 30 秒超时。取证用途的东西不值得让一次发布多等 30 秒，5 秒足够。
 KUAISHOU_DEBUG_SHOT_TIMEOUT_MS = 5_000
 
-# 失败取证的目录（.gitignore 里已忽略）。和小红书那条路统一，排障时只看一个地方。
-KUAISHOU_SCREENSHOT_DIR = "screenshots"
+# 失败取证的目录由 `myUtils/publish_evidence` 统一决定（`screenshots/kuaishou/`）。
+# 原来是这里自己拼 "screenshots" + 另一个 `ks_debug/`，两个地方各存一半，
+# 排障时得翻两处——现在五个平台都只有 `screenshots/<平台>/` 一个落点。
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -88,19 +90,22 @@ async def _debug_shot(page: Page, tag: str) -> str:
 
     取证是好事，但它必须**有界、落盘、且异常不外溢**。
     """
-    import time
-    try:
-        base = Path(KUAISHOU_SCREENSHOT_DIR)
-        base.mkdir(parents=True, exist_ok=True)
-        path = base / f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}.png"
-        await page.screenshot(
-            path=str(path), full_page=True, timeout=KUAISHOU_DEBUG_SHOT_TIMEOUT_MS
-        )
-        kuaishou_logger.warning(_msg("📸", f"已保存截图: {path}"))
-        return str(path)
-    except Exception as exc:  # noqa: BLE001 —— 截图失败绝不能影响发布
-        kuaishou_logger.warning(_msg("📸", f"截图失败（不影响发布继续）: {exc}"))
-        return ""
+    return await evidence.capture(
+        page,
+        "kuaishou",
+        tag,
+        logger=kuaishou_logger,
+        timeout_ms=KUAISHOU_DEBUG_SHOT_TIMEOUT_MS,
+    )
+
+
+class KsPageUnreachable(RuntimeError):
+    """cookie 校验时**压根打不开快手页面**（网络问题）。
+
+    必须和"cookie 确实失效"分开报：这两种情况以前都走 `cookie_auth` 返回 False，
+    于是网络瞬断（`net::ERR_CONNECTION_CLOSED`、机器被并发发布压住）会被报成
+    "cookie文件已失效，请先完成快手登录"——把人骗去重新扫码，而账号其实是好的。
+    """
 
 
 async def _goto_ks_page(
@@ -161,24 +166,21 @@ async def _wait_ks_upload_page(page: Page, timeout_ms: int = 30_000) -> None:
 
 
 async def _dump_page_debug(page, tag: str) -> str:
-    """出错时保存整页截图 + 当前 HTML，返回保存目录，便于对照新 DOM 修选择器。"""
-    import time
-    base = Path("ks_debug")
-    base.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    try:
-        await page.screenshot(
-            path=str(base / f"{tag}_{ts}.png"),
-            full_page=True,
-            timeout=KUAISHOU_DEBUG_SHOT_TIMEOUT_MS,
-        )
-    except Exception:
-        pass
-    try:
-        (base / f"{tag}_{ts}.html").write_text(await page.content(), encoding="utf-8")
-    except Exception:
-        pass
-    return str(base.resolve())
+    """出错时保存整页截图 + 当前 HTML，返回保存目录，便于对照新 DOM 修选择器。
+
+    落点和 `_debug_shot` 一样是 `screenshots/kuaishou/`（原来是单独的 `ks_debug/`，
+    和失败截图分家；选择器对不上时要同时看这两处才知道页面到底长什么样）。
+    返回值仍然是**目录**——调用方把它写进错误信息里给用户看。
+    """
+    await evidence.capture(
+        page,
+        "kuaishou",
+        tag,
+        logger=kuaishou_logger,
+        html=True,
+        timeout_ms=KUAISHOU_DEBUG_SHOT_TIMEOUT_MS,
+    )
+    return str(evidence.platform_dir("kuaishou"))
 
 
 async def _focus_desc_editor(page) -> None:
@@ -440,7 +442,11 @@ async def cookie_auth(account_file):
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await _goto_ks_page(page, what="快手发布页（cookie 校验）")
+            try:
+                await _goto_ks_page(page, what="快手发布页（cookie 校验）")
+            except Exception as exc:  # noqa: BLE001
+                # 打不开页面 ≠ 登录态失效，见 KsPageUnreachable 的说明
+                raise KsPageUnreachable(f"打不开快手发布页：{exc}") from exc
             await page.wait_for_timeout(3000)
 
             # 检查是否被重定向到登录页
@@ -468,9 +474,20 @@ async def cookie_auth(account_file):
                 if await _is_ks_cookie_invalid(page):
                     kuaishou_logger.info(_msg("🥹", "cookie 已失效（机构服务页）"))
                     return False
-                # 都没命中：保守判定为失效，避免假阳性
-                kuaishou_logger.warning(_msg("😵", "无法确认 cookie 有效性，按失效处理"))
-                return False
+                # 上传入口没等到，而页面上**也没有任何"未登录"的迹象**（没跳登录页、
+                # 没有"立即登录"、也不是机构服务页）——这多半是页面慢/没渲染完
+                # （并发跑发布、机器被压住时很常见），**不是**登录态失效。
+                #
+                # 以前这里"保守判定为失效"，代价是网络一抖就把人骗去重新扫码，
+                # 而且报错原文是「cookie文件已失效，请先完成快手登录」——方向完全指错。
+                # 现在抛 KsPageUnreachable：照样挡住这次发布（该有的保守不变），
+                # 但说的是实话，用户重跑一次通常就好了。
+                raise KsPageUnreachable(
+                    "快手发布页 25 秒内没渲染出上传入口（页面上没有未登录的迹象，多半是页面慢）"
+                )
+        except KsPageUnreachable:
+            # 打不开页面属于网络问题，往上抛；不能被下面那个 except 吞成 False（= 登录态失效）
+            raise
         except Exception as exc:
             kuaishou_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
@@ -480,7 +497,18 @@ async def cookie_auth(account_file):
 
 async def ks_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
     account_file = get_absolute_path(account_file, "ks_uploader")
-    if not os.path.exists(account_file) or not await cookie_auth(account_file):
+    try:
+        verified = os.path.exists(account_file) and await cookie_auth(account_file)
+    except KsPageUnreachable as exc:
+        # 打不开页面 ≠ 登录态失效：报一个单独的 reason，别让界面提示"重新登录"
+        if not handle:
+            result = _build_login_result(
+                False, "page_unreachable",
+                f"{exc}（账号和登录态都没问题，不用重新扫码）", account_file,
+            )
+            return result if return_detail else False
+        raise
+    if not verified:
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
             return result if return_detail else False
@@ -603,7 +631,16 @@ class KSBaseUploader(BaseVideoUploader):
     async def validate_base_args(self):
         if not os.path.exists(self.account_file):
             raise RuntimeError(f"cookie文件不存在，请先完成快手登录: {self.account_file}")
-        if not await cookie_auth(self.account_file):
+        try:
+            verified = await cookie_auth(self.account_file)
+        except KsPageUnreachable as exc:
+            # 这条消息会原样进发布记录，所以说清楚"是打不开，不是失效"——
+            # 否则用户会照着提示去重新扫码，而问题在网络/并发上。
+            raise RuntimeError(
+                f"{exc}（账号和登录态都没问题，不用重新扫码；"
+                f"多半是网络到 cp.kuaishou.com 不通，或机器被并发任务压住了）"
+            ) from exc
+        if not verified:
             raise RuntimeError(f"cookie文件已失效，请先完成快手登录: {self.account_file}")
 
         if self.publish_strategy is None:
@@ -846,6 +883,7 @@ class KSVideo(KSBaseUploader):
         context = await set_init_script(context)
 
         upload_success = False
+        page = None
         try:
             page = await context.new_page()
             await _goto_ks_page(page, what="快手上传主页")
@@ -950,6 +988,12 @@ class KSVideo(KSBaseUploader):
                 )
 
             upload_success = True
+        except Exception:
+            # **失败必须留现场**：上面重试分支里那张受 `self.debug` 控制、且只覆盖
+            # "点发布"那一段；这里是无条件的最后一道，失败出在哪一步都能对图排查。
+            if page is not None:
+                await _debug_shot(page, f"{Path(self.file_path).stem}-publish-failed")
+            raise
         finally:
             if upload_success:
                 await context.storage_state(path=self.account_file)

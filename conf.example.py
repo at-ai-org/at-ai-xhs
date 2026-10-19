@@ -110,13 +110,14 @@ PDD_MANAGE_URL = "https://live.pinduoduo.com/n-creator/video/video-manage"
 #   首次接入（选择器还没被真实页面验证过）建议有头跑一次，直接看页面比翻日志快。
 PDD_HEADLESS = _env_flag("SAU_PDD_HEADLESS", True)
 
-# PDD_DEBUG_DUMP：每一步都往 pdd_debug/ 里存一份 HTML + 全页截图。
+# PDD_DEBUG_DUMP：每一步都往 screenshots/pdd/ 里存一份 HTML + 全页截图。
 #   为什么默认从宽：拼多多这条链路是本项目第一个**在写代码时拿不到登录态页面**的平台
 #   （发布页必须登录才渲染），选择器只能按平台前端产物里扒出来的文案先写一版。
 #   所以第一次用真实账号跑时，把开关打开（SAU_PDD_DUMP=1），失败时直接把 dump 目录给我，
 #   改选择器一次到位，而不是靠猜。
+#   目录不再单独配置：五个平台的现场统一由 `myUtils/publish_evidence.py` 落在
+#   `screenshots/<平台>/` 下，这个开关只决定"每一步都存"还是"只在失败时存"。
 PDD_DEBUG_DUMP = _env_flag("SAU_PDD_DUMP", False)
-PDD_DEBUG_DIR = "pdd_debug"
 
 # 发布页的硬约束（从平台发布页前端产物里读出来的，不是猜的）。
 #

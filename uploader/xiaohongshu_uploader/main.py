@@ -12,6 +12,7 @@ from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+import myUtils.publish_evidence as evidence
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.humanize import human_type
@@ -838,11 +839,24 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             storage_state=self.account_file,
         )
 
+        page = None
         try:
             page = await context.new_page()
             await self.upload_video_content(page)
             await context.storage_state(path=self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
+        except Exception:
+            # **失败必须留现场**（`screenshots/xiaohongshu/`）：流程里每一步失败其实
+            # 已经各自拍过一张（见 page_ops 的 `screenshot()`），但那些是"哪一步坏"的
+            # 现场；这里再拍一张整页的收尾现场，失败发生在步骤之外时也有图可看。
+            if page is not None:
+                await evidence.capture(
+                    page,
+                    "xiaohongshu",
+                    f"{Path(self.file_path).stem}-publish-failed",
+                    logger=xiaohongshu_logger,
+                )
+            raise
         finally:
             await context.close()
             await browser.close()
